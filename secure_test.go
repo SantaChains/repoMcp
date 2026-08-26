@@ -18,12 +18,12 @@ func TestSanitizeError_GithubPATs(t *testing.T) {
 	prefixGHS := "ghs_" + strings.Repeat("z", 36)
 
 	cases := map[string]string{
-		"prefix " + prefixGHP + " suffix":                 "prefix <REDACTED> suffix",
-		"prefix " + prefixGHPFine + " suffix":             "prefix <REDACTED> suffix",
-		"prefix " + prefixGHO + " suffix":                 "prefix <REDACTED> suffix",
-		"prefix " + prefixGHS + " suffix":                 "prefix <REDACTED> suffix",
-		"Authorization: " + prefixGHP + " done":          "<REDACTED> done",
-		"curl with Bearer " + prefixGHP + " ok":           "curl with <REDACTED> ok",
+		"prefix " + prefixGHP + " suffix":       "prefix <REDACTED> suffix",
+		"prefix " + prefixGHPFine + " suffix":   "prefix <REDACTED> suffix",
+		"prefix " + prefixGHO + " suffix":       "prefix <REDACTED> suffix",
+		"prefix " + prefixGHS + " suffix":       "prefix <REDACTED> suffix",
+		"Authorization: " + prefixGHP + " done": "<REDACTED> done",
+		"curl with Bearer " + prefixGHP + " ok": "curl with <REDACTED> ok",
 	}
 	for in, want := range cases {
 		got := SanitizeError(in, nil)
@@ -70,16 +70,16 @@ func TestSanitizeError_ExtraPatsLongFirst(t *testing.T) {
 // TestMaskShort 各种边界情况。
 func TestMaskShort(t *testing.T) {
 	cases := []struct {
-		in        string
+		in         string
 		head, tail int
-		wantHead  byte
-		wantTail  byte
-		minStars  int
+		wantHead   byte
+		wantTail   byte
+		minStars   int
 	}{
-		{"0123456789", 4, 4, '0', '9', 2},            // 正好 head+tail。
-		{"abcdefghij", 2, 2, 'a', 'j', 4},            // 6 字符中间，至少 4。
-		{"a", 4, 4, '*', '*', 8},                     // 过短，*8。
-		{"", 4, 4, '*', '*', 8},                      // 空。
+		{"0123456789", 4, 4, '0', '9', 2},                           // 正好 head+tail。
+		{"abcdefghij", 2, 2, 'a', 'j', 4},                           // 6 字符中间，至少 4。
+		{"a", 4, 4, '*', '*', 8},                                    // 过短，*8。
+		{"", 4, 4, '*', '*', 8},                                     // 空。
 		{"abcdefghijklmnopqrstuvwxyz0123456789", 4, 4, 'a', '9', 1}, // 长。
 	}
 	for i, c := range cases {

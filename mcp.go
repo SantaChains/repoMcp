@@ -443,15 +443,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Error    string `json:"error,omitempty"`
 	}
 	out := struct {
-		Server            string       `json:"server"`
-		Ready             bool         `json:"ready"`
-		Repos             []repoHealth `json:"repos"`
-		LastSyncDurationMs int64       `json:"lastSyncDurationMs"`
-		LastSyncEnd       string       `json:"lastSyncEnd,omitempty"`
-		NextSyncInSeconds int64        `json:"nextSyncInSeconds"`
-		IndexedFiles      int          `json:"indexedFiles"`
-		IndexedLines      int64        `json:"indexedLines"`
-		IndexedSymbols    int64        `json:"indexedSymbols"`
+		Server             string       `json:"server"`
+		Ready              bool         `json:"ready"`
+		Repos              []repoHealth `json:"repos"`
+		LastSyncDurationMs int64        `json:"lastSyncDurationMs"`
+		LastSyncEnd        string       `json:"lastSyncEnd,omitempty"`
+		NextSyncInSeconds  int64        `json:"nextSyncInSeconds"`
+		IndexedFiles       int          `json:"indexedFiles"`
+		IndexedLines       int64        `json:"indexedLines"`
+		IndexedSymbols     int64        `json:"indexedSymbols"`
 	}{Server: serverTitle + "/" + serverVersion, NextSyncInSeconds: -1}
 
 	var files, symbols int

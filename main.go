@@ -233,8 +233,8 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		// 工具调用可能触发 git 子进程，写超时需宽于 gitTimeout。
-		WriteTimeout:  cfg.gitTimeout + 30*time.Second,
-		IdleTimeout:   120 * time.Second,
+		WriteTimeout:   cfg.gitTimeout + 30*time.Second,
+		IdleTimeout:    120 * time.Second,
 		MaxHeaderBytes: 1 << 20, // 1 MB：防止恶意 header flood。
 	}
 

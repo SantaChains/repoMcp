@@ -49,7 +49,10 @@ func TestSafeRelPath(t *testing.T) {
 }
 
 func TestIsHardExcluded(t *testing.T) {
-	cases := []struct{ in string; want bool }{
+	cases := []struct {
+		in   string
+		want bool
+	}{
 		{"src/x.go", false},
 		{"src/node_modules/lib/index.js", true},
 		{"vendor/glide.lock", true},

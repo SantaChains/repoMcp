@@ -26,23 +26,23 @@ const (
 	issueDupThreshold = 0.55
 	issueDupMax       = 5
 
-	issueTitleMinRunes = 6
-	issueTitleMaxRunes = 200
-	issueBodyMinRunes  = 20
-	issueBodyMaxRunes  = 8000   // 正文不超过 8000 字
-	issueEvidMinRunes  = 10
-	issueEvidMaxRunes  = 4000   // 调研结论不超过 4000 字
-	issueNoteMinRunes  = 10
-	issueNoteMaxRunes  = 4000   // 评论不超过 4000 字
-	issueReproMaxRunes = 2000   // 触发条件段上限
-	issueEnvMaxRunes   = 1000   // 环境段上限
-	issueReporterMaxRunes = 60  // reporter 字段不超过 60 字
-	issueLabelMaxRunes  = 40    // 单个标签名上限
-	issueLabelsMaxPerCall = 20  // 单次 add/remove 标签数上限
+	issueTitleMinRunes    = 6
+	issueTitleMaxRunes    = 200
+	issueBodyMinRunes     = 20
+	issueBodyMaxRunes     = 8000 // 正文不超过 8000 字
+	issueEvidMinRunes     = 10
+	issueEvidMaxRunes     = 4000 // 调研结论不超过 4000 字
+	issueNoteMinRunes     = 10
+	issueNoteMaxRunes     = 4000 // 评论不超过 4000 字
+	issueReproMaxRunes    = 2000 // 触发条件段上限
+	issueEnvMaxRunes      = 1000 // 环境段上限
+	issueReporterMaxRunes = 60   // reporter 字段不超过 60 字
+	issueLabelMaxRunes    = 40   // 单个标签名上限
+	issueLabelsMaxPerCall = 20   // 单次 add/remove 标签数上限
 
 	// rate limiter：每小时上限。
-	issueGlobalPerHourSoft = 60    // 全局每小时最多 60 次创建（兜底 flood）
-	issueReporterPerHour   = 10    // 单 reporter 桶每小时最多 10 次创建
+	issueGlobalPerHourSoft = 60 // 全局每小时最多 60 次创建（兜底 flood）
+	issueReporterPerHour   = 10 // 单 reporter 桶每小时最多 10 次创建
 )
 
 // ── 频率限制 ────────────────────────────────────────────────
@@ -51,10 +51,10 @@ const (
 // 配额在调用 GitHub **之前**扣除：创建失败也照扣，宁可少提也不能让失败重试变成刷屏。
 type issueRateLimiter struct {
 	mu       sync.Mutex
-	perHour  int // 0 = 不限 per-repo；global / reporter 桶始终生效
-	hist     map[string][]time.Time    // repo -> timestamps
-	global   []time.Time                // 全局全局时间戳列表
-	reporter map[uint64][]time.Time    // reporter hash -> timestamps
+	perHour  int                    // 0 = 不限 per-repo；global / reporter 桶始终生效
+	hist     map[string][]time.Time // repo -> timestamps
+	global   []time.Time            // 全局全局时间戳列表
+	reporter map[uint64][]time.Time // reporter hash -> timestamps
 }
 
 func newIssueRateLimiter(perHour int) *issueRateLimiter {

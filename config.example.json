@@ -21,6 +21,19 @@
         "write": true,
         "labels": ["bug", "enhancement", "question", "documentation"]
       }
+    },
+    {
+      "name": "cmbok_app",
+      "desc": "cmbok_app：Dart Flutter 移动端应用（多仓示例）",
+      "url": "https://github.com/hlning/cmbok_app.git",
+      "ref": "main",
+      "webBase": "https://github.com/hlning/cmbok_app",
+      "exclude": ["**/*.g.dart", "**/*.freezed.dart", "**/build/**", "**/.dart_tool/**", "**/ios/Pods/**", "**/android/.gradle/**"],
+      "issues": {
+        "slug": "hlning/cmbok_app",
+        "write": false,
+        "labels": []
+      }
     }
   ]
 }
