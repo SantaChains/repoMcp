@@ -2,7 +2,7 @@
 //
 // 输出刻意是紧凑纯文本而非 JSON：消费方是 IM 里的小模型，JSON 包装只增加 token
 // 却不提升可读性。每条结果都带 路径:行号 与 permalink，保证答案可被人工核验。
-// 所有输出都过字节预算（cfg.MaxResponseBytes），因为 LangBot 不截断 tool 返回。
+// 所有输出都过字节预算（cfg.MaxResponseBytes），因为消费方 MCP 客户端不截断 tool 返回。
 package main
 
 import (
@@ -129,7 +129,9 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 			}
 			out, err := d.Handle(ctx, args)
 			if err != nil {
-				return "", err
+				// 工具错误统一过滤：防止 token / 本地路径 泄漏给客户端。
+				msg := SanitizeError(err.Error(), s.sensitivePats)
+				return "", errors.New(msg)
 			}
 			if strings.TrimSpace(out) == "" {
 				return "（无结果）", nil

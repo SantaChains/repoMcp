@@ -2,11 +2,12 @@
 //
 // 为什么是无状态：本服务的每个工具调用都是纯查询，不存在跨调用的会话态。
 // 因此不下发 Mcp-Session-Id，POST 一律以 application/json 单次响应；
-// 客户端（LangBot）随时重连都能立刻用，也无需服务端维护长连接与会话回收。
-// GET/DELETE 因此返回 405——无服务端主动推送，也无会话可终止。
+// 客户端（MCP 消费方）随时重连都能立刻用，也无需服务端维护长连接与会话回收。
+// GET/DELETE 因此返回 405——无服务端主动推送流，也无会话可终止。
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -19,11 +20,64 @@ import (
 const (
 	// 实现面向的协议版本；initialize 时若客户端声明了受支持的其它版本则回声该版本。
 	protocolVersion = "2025-06-18"
-	serverTitle     = "repo-mcp"
-	serverVersion   = "0.1.0"
 
 	maxRequestBytes = 1 << 20
+	maxErrMsgLen    = 1024 // 错误消息长度封顶，超出以 … 截断。
 )
+
+// truncateMsg 把 s 限制为最多 max 个 rune；超出保留前 max-1 个 rune + 省略号 …。
+func truncateMsg(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	if max == 1 {
+		return "…"
+	}
+	return string(runes[:max-1]) + "…"
+}
+
+// normalizeID 规范 JSON-RPC id。空/非法 -> 置 null；合法 string/number/bool/null 原样。
+// 长 ID 直接兼容，不做截断。
+func normalizeID(id json.RawMessage) json.RawMessage {
+	id = bytes.TrimSpace(id)
+	if len(id) == 0 || bytes.Equal(id, []byte("null")) {
+		return json.RawMessage("null")
+	}
+	// 尝试常见合法 JSON 标量类型解析；失败就判为非法，回退 null。
+	var (
+		s  string
+		f  float64
+		i  int64
+		b  bool
+		js json.RawMessage // 任意合法 JSON 值
+	)
+	// 第一轮：先用宽松的 RawMessage 检查 JSON 语法。
+	if err := json.Unmarshal(id, &js); err != nil {
+		return json.RawMessage("null")
+	}
+	// 第二轮：要求是标量（string / number / bool / null），不允许对象或数组作 id。
+	first := id[0]
+	switch first {
+	case '"': // string
+		if json.Unmarshal(id, &s) == nil {
+			return id
+		}
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9': // number
+		if json.Unmarshal(id, &f) == nil {
+			return id
+		}
+		_ = i
+	case 't', 'f': // bool
+		if json.Unmarshal(id, &b) == nil {
+			return id
+		}
+	}
+	return json.RawMessage("null")
+}
 
 // 本服务支持的协议版本集合，用于 initialize 协商与 MCP-Protocol-Version 头校验。
 var supportedProtocols = map[string]bool{
@@ -81,6 +135,22 @@ func (s *Server) authorize(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(got)), []byte(s.cfg.Token)) == 1
 }
 
+// setCORS 设置 MCP 端点的 CORS 响应头。无 Origin 时用 *，否则回显 Origin（允许跨端接入）。
+func setCORS(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = "*"
+	}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, MCP-Protocol-Version")
+	w.Header().Set("Access-Control-Expose-Headers", "MCP-Protocol-Version, X-Trace-ID")
+	w.Header().Set("Access-Control-Max-Age", "86400")
+	if origin != "*" {
+		w.Header().Set("Vary", "Origin")
+	}
+}
+
 // handleMCP 是唯一的 MCP 端点。
 func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(r) {
@@ -91,17 +161,29 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
+		setCORS(w, r)
+		tid := r.Header.Get("X-Trace-ID")
+		if tid == "" {
+			tid = r.Header.Get("Trace-ID")
+		}
+		reqCtx := WithTraceID(r.Context(), tid)
+		tid = TraceID(reqCtx)
+		w.Header().Set("X-Trace-ID", tid)
+		r = r.WithContext(reqCtx)
 	case http.MethodGet, http.MethodDelete:
 		// 无状态实现：没有服务端主动推送流，也没有会话可删除。
 		w.Header().Set("Allow", "POST")
+		setCORS(w, r)
 		http.Error(w, "method not allowed: this server is stateless", http.StatusMethodNotAllowed)
 		return
 	case http.MethodOptions:
+		setCORS(w, r)
 		w.Header().Set("Allow", "POST, OPTIONS")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	default:
 		w.Header().Set("Allow", "POST")
+		setCORS(w, r)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -136,7 +218,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal([]byte(trimmed), &batch); err != nil {
 			writeRPC(w, http.StatusBadRequest, rpcResponse{
 				JSONRPC: "2.0", ID: json.RawMessage("null"),
-				Error: &rpcError{Code: codeParse, Message: "parse error: " + err.Error()},
+				Error: &rpcError{Code: codeParse, Message: truncateMsg("parse error: "+err.Error(), maxErrMsgLen)},
 			})
 			return
 		}
@@ -158,7 +240,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal([]byte(trimmed), &req); err != nil {
 		writeRPC(w, http.StatusBadRequest, rpcResponse{
 			JSONRPC: "2.0", ID: json.RawMessage("null"),
-			Error: &rpcError{Code: codeParse, Message: "parse error: " + err.Error()},
+			Error: &rpcError{Code: codeParse, Message: truncateMsg("parse error: "+err.Error(), maxErrMsgLen)},
 		})
 		return
 	}
@@ -186,7 +268,14 @@ func (s *Server) dispatch(ctx context.Context, req *rpcRequest) (rpcResponse, bo
 		if isNotification {
 			return rpcResponse{}, false
 		}
-		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result, Error: rerr}, true
+		if rerr != nil {
+			rerr.Message = truncateMsg(rerr.Message, maxErrMsgLen)
+			// 如果 Data 也是字符串，长度同样封顶。
+			if ds, ok := rerr.Data.(string); ok {
+				rerr.Data = truncateMsg(ds, maxErrMsgLen)
+			}
+		}
+		return rpcResponse{JSONRPC: "2.0", ID: normalizeID(req.ID), Result: result, Error: rerr}, true
 	}
 
 	switch req.Method {
@@ -354,11 +443,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Error    string `json:"error,omitempty"`
 	}
 	out := struct {
-		Server string       `json:"server"`
-		Ready  bool         `json:"ready"`
-		Repos  []repoHealth `json:"repos"`
-	}{Server: serverTitle + "/" + serverVersion}
+		Server            string       `json:"server"`
+		Ready             bool         `json:"ready"`
+		Repos             []repoHealth `json:"repos"`
+		LastSyncDurationMs int64       `json:"lastSyncDurationMs"`
+		LastSyncEnd       string       `json:"lastSyncEnd,omitempty"`
+		NextSyncInSeconds int64        `json:"nextSyncInSeconds"`
+		IndexedFiles      int          `json:"indexedFiles"`
+		IndexedLines      int64        `json:"indexedLines"`
+		IndexedSymbols    int64        `json:"indexedSymbols"`
+	}{Server: serverTitle + "/" + serverVersion, NextSyncInSeconds: -1}
 
+	var files, symbols int
+	var lines int64
 	ready := true
 	for _, r := range s.store.Repos() {
 		st, ok := stats[r.Name]
@@ -376,9 +473,24 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			ready = false
 		}
+		files += st.Files
+		lines += int64(st.Lines)
+		symbols += st.Symbols
 		out.Repos = append(out.Repos, h)
 	}
 	out.Ready = ready
+	out.IndexedFiles = files
+	out.IndexedLines = lines
+	out.IndexedSymbols = int64(symbols)
+
+	dur, lastEnd, nextIn := s.lastSyncStats()
+	out.LastSyncDurationMs = dur.Milliseconds()
+	if !lastEnd.IsZero() {
+		out.LastSyncEnd = lastEnd.Format("2006-01-02T15:04:05Z")
+	}
+	if nextIn >= 0 {
+		out.NextSyncInSeconds = int64(nextIn.Seconds())
+	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if !ready {

@@ -1,0 +1,25 @@
+{
+  "name": "repomcp",
+  "transport": "streamable_http",
+  "url": "http://127.0.0.1:8790/mcp",
+  "headers": {
+    "Authorization": "Bearer REPLACE_WITH_REPOMCP_SHARED_TOKEN_至少32字节随机串"
+  },
+  "timeout": 60,
+  "备注": [
+    "此文件是模板（可安全入库）。实际使用请复制本文件改名 astrbot_mcp.json，",
+    "填真实的 URL 与 Token，然后粘贴到 AstrBot WebUI -> MCP -> 新增服务器 的配置框。",
+    "",
+    "字段说明：",
+    "  name        服务在 AstrBot 工具列表中的显示标识，英文唯一即可。",
+    "  transport   必须写 streamable_http。repoMcp 只暴露 HTTP MCP 端点。",
+    "  url         repoMcp 的完整地址，必须以 /mcp 结尾。",
+    "                同机部署：   http://127.0.0.1:8790/mcp",
+    "                内网跨机：   http://<内网IP>:8790/mcp",
+    "                公网HTTPS：  https://<你的域名>/mcp （需反向代理+证书）",
+    "  headers     鉴权头：Bearer 后接 repoMcp config.json 中 token 字段的裸字符串。",
+    "  timeout     单次工具调用超时，单位秒。大仓 git_history 建议 >= 60。",
+    "",
+    "注意：astrbot_mcp.json（实配文件）已被 .gitignore 忽略，绝对不要提交到任何 Git 平台。"
+  ]
+}

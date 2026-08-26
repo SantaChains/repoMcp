@@ -29,47 +29,119 @@ const (
 	issueTitleMinRunes = 6
 	issueTitleMaxRunes = 200
 	issueBodyMinRunes  = 20
+	issueBodyMaxRunes  = 8000   // 正文不超过 8000 字
 	issueEvidMinRunes  = 10
+	issueEvidMaxRunes  = 4000   // 调研结论不超过 4000 字
 	issueNoteMinRunes  = 10
+	issueNoteMaxRunes  = 4000   // 评论不超过 4000 字
+	issueReproMaxRunes = 2000   // 触发条件段上限
+	issueEnvMaxRunes   = 1000   // 环境段上限
+	issueReporterMaxRunes = 60  // reporter 字段不超过 60 字
+	issueLabelMaxRunes  = 40    // 单个标签名上限
+	issueLabelsMaxPerCall = 20  // 单次 add/remove 标签数上限
+
+	// rate limiter：每小时上限。
+	issueGlobalPerHourSoft = 60    // 全局每小时最多 60 次创建（兜底 flood）
+	issueReporterPerHour   = 10    // 单 reporter 桶每小时最多 10 次创建
 )
 
 // ── 频率限制 ────────────────────────────────────────────────
 
-// issueRateLimiter 限制单仓每小时的 issue 创建量。
+// issueRateLimiter 双层速率限制：(1) 单仓每小时 + (2) 全局每小时 + (3) 单 reporter 哈希桶每小时。
 // 配额在调用 GitHub **之前**扣除：创建失败也照扣，宁可少提也不能让失败重试变成刷屏。
 type issueRateLimiter struct {
-	mu      sync.Mutex
-	perHour int // 0 = 不限
-	hist    map[string][]time.Time
+	mu       sync.Mutex
+	perHour  int // 0 = 不限 per-repo；global / reporter 桶始终生效
+	hist     map[string][]time.Time    // repo -> timestamps
+	global   []time.Time                // 全局全局时间戳列表
+	reporter map[uint64][]time.Time    // reporter hash -> timestamps
 }
 
 func newIssueRateLimiter(perHour int) *issueRateLimiter {
-	return &issueRateLimiter{perHour: perHour, hist: make(map[string][]time.Time)}
+	return &issueRateLimiter{
+		perHour:  perHour,
+		hist:     make(map[string][]time.Time),
+		global:   make([]time.Time, 0),
+		reporter: make(map[uint64][]time.Time),
+	}
 }
 
-// take 扣一次配额。失败时返回距下一个可用名额的等待时长。
-func (l *issueRateLimiter) take(repo string) (bool, time.Duration) {
-	if l.perHour <= 0 {
-		return true, 0
+// hashReporter 将 reporter 归一成哈希桶；空字符串被归到 bucket 0。
+func hashReporter(reporter string) uint64 {
+	s := strings.ToLower(strings.TrimSpace(reporter))
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
 	}
+	return h
+}
+
+// pruneOlder 返回一小时内的保留子集。
+func pruneOlder(now time.Time, xs []time.Time) []time.Time {
+	out := xs[:0]
+	for _, t := range xs {
+		if now.Sub(t) < time.Hour {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// take 扣一次配额（双层：repo + global + reporter 桶同时需要有额度）。
+// 返回 false 时附带预估等待时长（三种限流各自等待，取最大值给提示）。
+// reporter 为空会被统一归入默认桶。
+func (l *issueRateLimiter) take(repo, reporter string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
-	kept := l.hist[repo][:0]
-	for _, t := range l.hist[repo] {
-		if now.Sub(t) < time.Hour {
-			kept = append(kept, t)
+
+	// 1. 全局桶。
+	l.global = pruneOlder(now, l.global)
+	var globalWait time.Duration
+	if len(l.global) >= issueGlobalPerHourSoft {
+		globalWait = time.Hour - now.Sub(l.global[0])
+	}
+
+	// 2. reporter 桶。
+	rHash := hashReporter(reporter)
+	l.reporter[rHash] = pruneOlder(now, l.reporter[rHash])
+	var reporterWait time.Duration
+	if len(l.reporter[rHash]) >= issueReporterPerHour {
+		reporterWait = time.Hour - now.Sub(l.reporter[rHash][0])
+	}
+
+	// 3. 单 repo 桶（perHour=0 时跳过）。
+	var repoWait time.Duration
+	if l.perHour > 0 {
+		l.hist[repo] = pruneOlder(now, l.hist[repo])
+		if len(l.hist[repo]) >= l.perHour {
+			repoWait = time.Hour - now.Sub(l.hist[repo][0])
 		}
 	}
-	l.hist[repo] = kept
-	if len(kept) >= l.perHour {
-		return false, time.Hour - now.Sub(kept[0])
+
+	wait := globalWait
+	if reporterWait > wait {
+		wait = reporterWait
 	}
-	l.hist[repo] = append(kept, now)
+	if repoWait > wait {
+		wait = repoWait
+	}
+	if wait > 0 {
+		return false, wait
+	}
+
+	// 通过：三处同时扣一次。
+	l.global = append(l.global, now)
+	l.reporter[rHash] = append(l.reporter[rHash], now)
+	if l.perHour > 0 {
+		l.hist[repo] = append(l.hist[repo], now)
+	}
 	return true, 0
 }
 
-// remaining 返回当前小时内剩余可创建数；不限额时返回 -1。
+// remaining 返回某单仓在过去一小时窗口内剩余可创建数（不考虑 global / reporter 上限，仅 per-repo）。
+// 限额关闭时返回 -1。
 func (l *issueRateLimiter) remaining(repo string) int {
 	if l.perHour <= 0 {
 		return -1
@@ -382,13 +454,44 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 	title := strings.TrimSpace(argStr(args, "title"))
 	body := strings.TrimSpace(argStr(args, "body"))
 	evidence := strings.TrimSpace(argStr(args, "evidence"))
+	repro := strings.TrimSpace(argStr(args, "repro"))
+	env := strings.TrimSpace(argStr(args, "env"))
+	reporter := strings.TrimSpace(argStr(args, "reporter"))
 	confidence := strings.ToLower(strings.TrimSpace(argStr(args, "confidence")))
+	labels := splitList(argStr(args, "labels"))
 
 	if n := utf8.RuneCountInString(title); n < issueTitleMinRunes || n > issueTitleMaxRunes {
 		return "", fmt.Errorf("title 长度需在 %d–%d 字之间，当前 %d 字", issueTitleMinRunes, issueTitleMaxRunes, n)
 	}
-	if utf8.RuneCountInString(body) < issueBodyMinRunes {
+	if n := utf8.RuneCountInString(body); n < issueBodyMinRunes {
 		return "", fmt.Errorf("body 太短（不足 %d 字）：需写清用户做了什么、期望什么、实际发生什么", issueBodyMinRunes)
+	} else if n > issueBodyMaxRunes {
+		return "", fmt.Errorf("body 过长（%d 字），上限 %d 字；若确需长文本，请将次要信息移入附件或压缩摘要后再贴", n, issueBodyMaxRunes)
+	}
+	if n := utf8.RuneCountInString(evidence); n < issueEvidMinRunes {
+		if confidence == "confirmed" || confidence == "yes" || confidence == "true" {
+			return "", fmt.Errorf("confidence=confirmed 时 evidence 必须给出 路径:行号 与判断依据；调研不足请先用 search_code / find_symbol 再来")
+		}
+		return "", fmt.Errorf("evidence 不能省略：即使未能定位，也要写明检索过哪些关键词、看过哪些文件、为什么无法确认")
+	} else if n > issueEvidMaxRunes {
+		return "", fmt.Errorf("evidence 过长（%d 字），上限 %d 字", n, issueEvidMaxRunes)
+	}
+	if n := utf8.RuneCountInString(repro); n > issueReproMaxRunes {
+		return "", fmt.Errorf("repro 过长（%d 字），上限 %d 字", n, issueReproMaxRunes)
+	}
+	if n := utf8.RuneCountInString(env); n > issueEnvMaxRunes {
+		return "", fmt.Errorf("env 过长（%d 字），上限 %d 字", n, issueEnvMaxRunes)
+	}
+	if n := utf8.RuneCountInString(reporter); n > issueReporterMaxRunes {
+		return "", fmt.Errorf("reporter 过长（%d 字），上限 %d 字", n, issueReporterMaxRunes)
+	}
+	if len(labels) > issueLabelsMaxPerCall {
+		return "", fmt.Errorf("labels 过多：本次 %d 个，单次最多 %d 个", len(labels), issueLabelsMaxPerCall)
+	}
+	for _, lb := range labels {
+		if n := utf8.RuneCountInString(lb); n > issueLabelMaxRunes {
+			return "", fmt.Errorf("label %q 超过 %d 字（%d）", lb, issueLabelMaxRunes, n)
+		}
 	}
 	var confirmed bool
 	switch confidence {
@@ -398,12 +501,6 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 		confirmed = false
 	default:
 		return "", fmt.Errorf("confidence 必须是 confirmed 或 unconfirmed，当前 %q", argStr(args, "confidence"))
-	}
-	if utf8.RuneCountInString(evidence) < issueEvidMinRunes {
-		if confirmed {
-			return "", fmt.Errorf("confidence=confirmed 时 evidence 必须给出 路径:行号 与判断依据；调研不足请先用 search_code / find_symbol 再来")
-		}
-		return "", fmt.Errorf("evidence 不能省略：即使未能定位，也要写明检索过哪些关键词、看过哪些文件、为什么无法确认")
 	}
 	if confirmed && !strings.Contains(evidence, ":") && !strings.Contains(evidence, "：") {
 		return "", fmt.Errorf("confidence=confirmed 但 evidence 里没有 路径:行号 形式的出处；若确实定位不到请改用 unconfirmed")
@@ -429,15 +526,16 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 		}
 	}
 
-	if ok, wait := s.limiter.take(r.Name); !ok {
-		return "", fmt.Errorf("未创建：%s 每小时最多创建 %d 个 issue，已达上限，约 %d 分钟后可再试。"+
-			"请先把已有 issue 的链接回复用户，或用 update_issue 在既有 issue 下补充", r.Name, s.cfg.issueLimit, int(wait.Minutes())+1)
+	if ok, wait := s.limiter.take(r.Name, reporter); !ok {
+		return "", fmt.Errorf("未创建：%s 已达创建上限（单仓 %d/小时 / 全局 %d/小时 / 同 reporter %d/小时），"+
+			"约 %d 分钟后可再试。请先把已有 issue 的链接回复用户，或用 update_issue 在既有 issue 下补充",
+			r.Name, s.cfg.issueLimit, issueGlobalPerHourSoft, issueReporterPerHour, int(wait.Minutes())+1)
 	}
 
-	labels, dropped := s.pickLabels(ctx, r, splitList(argStr(args, "labels")))
+	labels, dropped := s.pickLabels(ctx, r, labels)
 	draft := IssueDraft{
 		Title:  title,
-		Body:   s.renderIssueBody(r, body, evidence, confirmed, argStr(args, "repro"), argStr(args, "env"), argStr(args, "reporter")),
+		Body:   s.renderIssueBody(r, body, evidence, confirmed, repro, env, reporter),
 		Labels: labels,
 	}
 	iss, err := s.gh.Create(ctx, r, draft)
@@ -535,7 +633,7 @@ func (s *Server) renderIssueBody(r *Repo, body, evidence string, confirmed bool,
 		who = "IM 用户"
 	}
 	b.WriteString("\n---\n\n")
-	b.WriteString(fmt.Sprintf("由聊天机器人代 **%s** 提交", truncate(who, 60)))
+	b.WriteString(fmt.Sprintf("由 SantaChains 代 **%s** 提交", truncate(who, 60)))
 	if head := s.shortHead(r.Name); head != "" {
 		b.WriteString(fmt.Sprintf("（repoMcp，索引 commit `%s`）", head))
 	}
@@ -560,8 +658,25 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 		action = "comment"
 	}
 	comment := strings.TrimSpace(argStr(args, "comment"))
+	reason := strings.ToLower(strings.TrimSpace(argStr(args, "reason")))
 	addLabels := splitList(argStr(args, "add_labels"))
 	rmLabels := splitList(argStr(args, "remove_labels"))
+
+	// 通用标签校验：单 label 长度 + 总数量上限（add+remove 合计）。
+	allLabels := append(append([]string(nil), addLabels...), rmLabels...)
+	if len(allLabels) > issueLabelsMaxPerCall {
+		return "", fmt.Errorf("标签变更过多：本次 %d 个，单次最多 %d 个（add_labels + remove_labels 合计）", len(allLabels), issueLabelsMaxPerCall)
+	}
+	for _, lb := range allLabels {
+		if n := utf8.RuneCountInString(lb); n > issueLabelMaxRunes {
+			return "", fmt.Errorf("label %q 超过 %d 字（%d）", lb, issueLabelMaxRunes, n)
+		}
+	}
+	if comment != "" {
+		if n := utf8.RuneCountInString(comment); n > issueNoteMaxRunes {
+			return "", fmt.Errorf("comment 过长（%d 字），上限 %d 字", n, issueNoteMaxRunes)
+		}
+	}
 
 	var edit IssueEdit
 	switch action {
@@ -570,10 +685,10 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 			return "", fmt.Errorf("action=comment 时至少要给出 comment 或标签变更")
 		}
 	case "close":
-		if utf8.RuneCountInString(comment) < issueNoteMinRunes {
+		if n := utf8.RuneCountInString(comment); n < issueNoteMinRunes {
 			return "", fmt.Errorf("关闭 issue 必须在 comment 里写清结论（已修复 / 无法复现 / 不予处理及原因），至少 %d 字", issueNoteMinRunes)
 		}
-		switch strings.ToLower(strings.TrimSpace(argStr(args, "reason"))) {
+		switch reason {
 		case "completed", "done", "fixed":
 			edit.StateReason = "completed"
 		case "not_planned", "notplanned", "wontfix", "invalid":
@@ -583,12 +698,23 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 		}
 		edit.State = "closed"
 	case "reopen", "open":
-		if utf8.RuneCountInString(comment) < issueNoteMinRunes {
+		if reason != "" {
+			return "", fmt.Errorf("action=reopen 不允许给出 reason（仅 close 需要指定关闭原因）")
+		}
+		if n := utf8.RuneCountInString(comment); n < issueNoteMinRunes {
 			return "", fmt.Errorf("重新打开 issue 必须在 comment 里说明理由，至少 %d 字", issueNoteMinRunes)
 		}
 		edit.State = "open"
 	default:
 		return "", fmt.Errorf("未知 action %q，可选：comment / close / reopen", action)
+	}
+
+	// 合法性二次确认：State/StateReason 组合必须符合 GitHub REST 语义（open 不带 state_reason / closed 必须二选一）。
+	if edit.State == "open" && edit.StateReason != "" {
+		return "", fmt.Errorf("state=open 时不能同时给出 state_reason")
+	}
+	if edit.State == "closed" && edit.StateReason != "completed" && edit.StateReason != "not_planned" {
+		return "", fmt.Errorf("state=closed 必须给出有效 state_reason（completed / not_planned）")
 	}
 
 	// 先读当前状态：重复关闭一个已关闭的 issue 只会制造噪声通知。
@@ -653,7 +779,7 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 
 // renderComment 给评论加上来源标注：仓库里必须能一眼看出哪些内容是机器人写的。
 func (s *Server) renderComment(body string) string {
-	return strings.TrimSpace(body) + "\n\n<sub>— 由聊天机器人经 repoMcp 提交</sub>\n"
+	return strings.TrimSpace(body) + "\n\n<sub>— 由 SantaChains 经 repoMcp 提交</sub>\n"
 }
 
 // ── 公共辅助 ────────────────────────────────────────────────

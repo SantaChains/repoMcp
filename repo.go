@@ -16,15 +16,63 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
 
 // ---- 基础设施：子进程执行 git ----
 
+const (
+	maxGitOutputBytes = 128 << 20 // 128 MiB：单个 git 子进程 stdout / stderr 输出上限。
+)
+
+// gitSem：全局并发 git 子进程信号量；上限 4..6（取 NumCPU 夹到范围）。
+var gitSem = func() chan struct{} {
+	n := runtime.NumCPU()
+	if n < 2 {
+		n = 2
+	}
+	if n > 6 {
+		n = 6
+	}
+	return make(chan struct{}, n)
+}()
+
+// limitedBuf：写入上限为 max 字节；超出字节被丢弃，overflow 置 true。
+// 用于限制子进程输出，避免吃满内存。bytes.Buffer 是变长的，不可靠。
+type limitedBuf struct {
+	buf      bytes.Buffer
+	max      int
+	overflow bool
+}
+
+func (l *limitedBuf) Write(p []byte) (int, error) {
+	remain := l.max - l.buf.Len()
+	if remain <= 0 {
+		l.overflow = true
+		return len(p), nil
+	}
+	if len(p) <= remain {
+		l.buf.Write(p)
+		return len(p), nil
+	}
+	l.buf.Write(p[:remain])
+	l.overflow = true
+	return len(p), nil
+}
+
 // stRunGit 在 dir 目录下以子进程方式执行 git 命令，捕获 stdout；非零退出时返回
 // 包含 stderr 摘要（截断至 500 字符）的错误。调用方必须提供带超时/取消的 context。
+// 会受全局 gitSem 并发信号量限制，且 stdout / stderr 各自最多 128 MiB。
 func stRunGit(ctx context.Context, dir string, args ...string) (string, error) {
+	select {
+	case gitSem <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	defer func() { <-gitSem }()
+
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -33,17 +81,25 @@ func stRunGit(ctx context.Context, dir string, args ...string) (string, error) {
 		"GIT_CONFIG_NOSYSTEM=1",
 		"LC_ALL=C",
 	)
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr limitedBuf
+	stdout.max = maxGitOutputBytes
+	stderr.max = maxGitOutputBytes
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
+		msg := strings.TrimSpace(stderr.buf.String())
 		if len(msg) > 500 {
 			msg = msg[:500]
 		}
+		if stderr.overflow {
+			msg += "…"
+		}
 		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
 	}
-	return stdout.String(), nil
+	if stdout.overflow {
+		return "", fmt.Errorf("git %s: 输出超过 %d 字节", strings.Join(args, " "), maxGitOutputBytes)
+	}
+	return stdout.buf.String(), nil
 }
 
 // IsProbablyBinary 判断内容是否可能为二进制：前 8KB 内含 NUL 字节，或非法 UTF-8
@@ -146,6 +202,8 @@ type Store struct {
 
 	mu     sync.RWMutex
 	status map[string]*stRepoStatus
+
+	shutdown atomic.Bool // Shutdown 设置为 true 后，syncLoop 退出。
 }
 
 var _ Storer = (*Store)(nil)
@@ -187,6 +245,13 @@ func (s *Store) Status(repo string) (head string, lastSync time.Time, lastErr er
 	}
 	return st.head, st.lastSync, st.lastErr
 }
+
+// Shutdown 置位关闭标记；syncLoop 下一次循环将检测到并立即退出。
+// 不取消正在进行的 Sync（由全局 ctx 负责）。
+func (s *Store) Shutdown() { s.shutdown.Store(true) }
+
+// IsShutdown 查询关闭标记。
+func (s *Store) IsShutdown() bool { return s.shutdown.Load() }
 
 // Sync 对每个仓库执行克隆或增量拉取；单仓失败不影响其它仓库，全部结果用 errors.Join 聚合返回。
 func (s *Store) Sync(ctx context.Context) error {

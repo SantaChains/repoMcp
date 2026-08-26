@@ -1,0 +1,361 @@
+repoMcp 接入 AstrBot 说明文档
+==============================
+适用范围：repoMcp（本仓）+ AstrBot v3.5.0 及以上
+部署方式：repoMcp 独立运行（Streamable HTTP），AstrBot 通过 HTTP MCP 协议连接
+文档更新日期：2026-08-26
+
+
+========================================
+第 1 章  概述
+========================================
+
+repoMcp 是一个白名单仓库源码检索 MCP 服务，提供源码检索、符号定位、
+文件片段读取、提交历史浏览等能力，并可选择性接入 GitHub issue 的
+检索与代提交。AstrBot v3.5.0 起原生支持 MCP 协议，可将 repoMcp 注册
+为工具源，让模型在对话中直接调用这些能力。
+
+本指南覆盖：
+  - 服务端（repoMcp）的配置、启动、探活
+  - 客户端（AstrBot）通过 WebUI 或配置文件接入 repoMcp
+  - 联调验证与工具清单
+  - 隐私文件边界（严禁传 GitHub 的内容）
+  - 常见故障排查
+
+接入协议选型：
+  repoMcp 只暴露无状态 Streamable HTTP 端点（POST /mcp），因此
+  AstrBot 侧必须使用 "transport": "streamable_http" 模式，而不是
+  command/stdio 模式。HTTP 模式不要求 AstrBot 容器内再装 Go 或 git，
+  repoMcp 可以跑在任意一台能被 AstrBot 访问到的机器上。
+
+
+========================================
+第 2 章  准备工作
+========================================
+
+2.1 软件版本
+  - Go 1.24+ （编译 repoMcp 时需要）
+  - Git 2.43+ （repoMcp clone 和 pull 仓库时需要，放在运行 repoMcp 的机器）
+  - AstrBot v3.5.0 或更高
+  - （可选）Python 3.10+ + uv，用于运行 mcp_probe.py 做握手联调
+
+2.2 网络与端口
+  - repoMcp 默认监听 0.0.0.0:8790（可改），端点为 /mcp，健康检查为 /healthz
+  - AstrBot 与 repoMcp 之间网络必须可达；若跨机部署注意防火墙放行
+  - 强烈建议在 repoMcp 与 AstrBot 之间走内网 / VPN，不要将 /mcp 直接暴露公网，
+    Authorization Bearer Token 只能防护请求，无法防 DoS
+
+2.3 凭据准备（至少准备以下两项）
+  a. MCP 共享 Token：32 字节以上随机字符串，用于 AstrBot 与 repoMcp 的鉴权
+     生成建议（PowerShell）：
+       -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 48 | % {[char]$_})
+     生成建议（Linux / macOS）：
+       openssl rand -base64 48 | tr -d '\n'; echo
+  b. （启用 issue 写入时必需）GitHub Personal Access Token：
+     - 需要 Issues 读/写权限（Fine-grained PAT 选 Repository permissions -> Issues -> Read and write）
+     - 如果只做 issue 检索只读则只给 Read
+     - 必须能访问 repos[*].url 对应的仓库
+
+
+========================================
+第 3 章  repoMcp 服务端部署
+========================================
+
+3.1 准备配置文件
+  复制 config.example.json 为 config.json，修改必要字段：
+    - token          填第 2.3-a 节生成的 MCP 共享 Token（裸字符串，不含 "Bearer "）
+    - dataDir        本地 clone 存放目录，建议绝对路径，目录需有读写权限
+    - githubToken    填第 2.3-b 节的 GitHub PAT（或留空用环境变量 REPOMCP_GITHUB_TOKEN）
+    - repos[] 每个条目：
+        name   短名（AstrBot 工具参数中引用，英文、无空格、唯一）
+        desc   给模型看的描述（中文更好，帮 LLM 选对仓库）
+        url    HTTPS Git 地址，PAT 能读即可；私有仓可在 URL 中嵌 token
+               （https://<user>:<PAT>@github.com/owner/repo.git）
+        ref    同步分支，通常 main 或 master
+        webBase 仓库网页根，用于生成 permalink（不写会自动用 url 推导）
+        exclude glob 黑名单，忽略大生成目录（如 node_modules、dist、i18n json）
+        issues.write  是否允许模型代用户创建/评论/关闭 issue
+        issues.labels 允许模型打哪些标签（白名单），空数组=不允许加标签
+  示例：
+    {
+      "name": "repo",
+      "desc": "SantaChains 主仓：Go 服务端源码与文档",
+      "url": "https://github.com/SantaChains/repo.git",
+      "ref": "main",
+      "webBase": "https://github.com/SantaChains/repo",
+      "exclude": ["vendor/**", "docs/i18n/*.json"],
+      "issues": { "write": true, "labels": ["bug", "enhancement", "question"] }
+    }
+
+3.2 编译与启动
+  方式 A：源码直接运行（开发 / 小场景）
+    go run . -config config.json
+  方式 B：先编译再运行（生产推荐）
+    go vet ./...
+    go build -o build/repomcp .
+    ./build/repomcp -config config.json
+  方式 C：Taskfile 快捷
+    task run      # go run
+    task build    # 交叉编译到 build/repomcp (linux-amd64)
+    task check    # go vet
+
+  辅助命令（用于部署流水线与自检，不启动服务）：
+    ./build/repomcp -version                         # 打印 标题/版本
+    ./build/repomcp -print-config -config config.json # 打印脱敏后的最终配置 JSON（Token/PAT 只显示 前4后4）
+    ./build/repomcp -check-config -config config.json # 校验 11 条强规则，打印摘要后退出
+
+3.3 首次同步与探活
+  首次启动后等待控制台输出 "所有仓库同步完成" 或观察 dataDir 下出现各仓 clone。
+  探活命令（无需鉴权）：
+    curl http://127.0.0.1:8790/healthz
+  预期返回 JSON：ready=true，每个仓库含 files、symbols、head_commit、error（空=正常）、
+  issues_read / issues_write（布尔）。如果某仓 error 非空，优先检查 url / ref / PAT 权限。
+  运维可额外消费以下字段（用于告警大盘）：
+    lastSyncDurationMs   最近一轮同步耗时（毫秒）
+    lastSyncEnd          最近一轮同步结束 UTC 时间
+    nextSyncInSeconds    距离下一次计划同步秒数（未启用周期同步为 -1）
+    indexedFiles / indexedLines / indexedSymbols   全部受管仓索引合计数
+
+  手动触发同步（需 Bearer 鉴权，与 /mcp 共用 Token）：
+    curl -X POST -H 'Authorization: Bearer 你的Token' \
+         -H 'Content-Type: application/json' \
+         -d '{"blocking":false}' http://127.0.0.1:8790/sync
+  - blocking=false（默认）：立即返回 202，status=scheduled（已调度）或 running（已有同步在跑）
+  - blocking=true：等待同步结束后返回 200，响应含 durationMs、lastSyncEnd、nextSyncInSec、shared（是否与并发请求共享本轮同步）
+  - 手动触发后会把下一次定时同步按 "此刻 + syncInterval" 重排
+
+3.4 MCP 握手联调（验证协议层）
+  用本仓的 mcp_probe.py 走一遍 initialize -> list_tools -> tools/call -> ping：
+    uv run --with mcp --with httpx --with anyio python mcp_probe.py
+  打远端：
+    REPOMCP_PROBE_URL=https://你的域名/mcp REPOMCP_PROBE_TOKEN=你的token \
+    uv run --with mcp --with httpx --with anyio python mcp_probe.py
+  必须最后输出 ALL OK；如果握手失败，先修服务端/网络，再进入 AstrBot 接入。
+
+
+========================================
+第 4 章  AstrBot 侧接入（两种方式任选其一）
+========================================
+
+前提：AstrBot v3.5.0+。因为 repoMcp 用 Streamable HTTP 传输，AstrBot 侧不需要
+再装 uv/npm（那些是 stdio 模式启动 MCP 子进程才用的），直接注册 HTTP 端点即可。
+
+----------------------------------------
+方式 1：WebUI 图形界面添加（推荐、最快）
+----------------------------------------
+1. 打开 AstrBot Dashboard -> 侧边栏「MCP」
+2. 点击「添加服务器」或「新增 MCP 服务器」
+3. 在配置框中粘贴 JSON（示例见同目录 astrbot_mcp.example.json，复制后修改 URL 和 Token）：
+
+    {
+      "transport": "streamable_http",
+      "url": "http://127.0.0.1:8790/mcp",
+      "headers": {
+        "Authorization": "Bearer 这里填第2.3-a节准备的MCP共享Token"
+      }
+    }
+
+4. 字段说明：
+   - transport   必须写 "streamable_http"，不能用默认 stdio
+   - url         端点路径必须带 /mcp；如果 repoMcp 与 AstrBot 不在同机，改 IP/域名；
+                 HTTPS 部署时写 https 前缀
+   - headers     必须带 Authorization，值为 "Bearer "（有空格）拼接共享 Token 原文
+   - 可选参数：AstrBot 若支持 timeout 字段，建议 60 秒（git_history 在大仓可能偏慢）
+5. 点击「测试连接」或「Test Connection」，通过后点「保存」
+6. 点击 AstrBot WebUI MCP 页的「同步服务器」按钮，让模型重新加载工具列表
+7. 在 AstrBot 对话中触发工具列表命令（不同平台命令不同，如 WebChat 输入 !func）
+   确认出现 5-9 个 repoMcp 工具（取决于是否开启 issue 读写）
+
+----------------------------------------
+方式 2：AstrBot 配置文件 / Docker 环境变量注入
+----------------------------------------
+1. 找到 AstrBot 的 MCP 配置位置（通常是 AstrBot data 目录下的配置 JSON 或
+   通过插件配置面板指定 mcp_servers 列表；具体路径以你部署方式为准）
+2. 在 mcp_servers 或对应列表中加入一条：
+
+    {
+      "name": "repomcp",
+      "transport": "streamable_http",
+      "url": "http://<repoMcp机器IP>:8790/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP共享Token>"
+      },
+      "timeout": 60
+    }
+
+3. 保存后重启 AstrBot（或按平台支持点热重载）
+4. 回到 WebUI MCP 页确认该服务状态为已连接
+
+----------------------------------------
+跨机部署 / HTTPS / 反向代理 特别提示
+----------------------------------------
+  - 若 repoMcp 跑在独立机，url 填内网 IP 优先；走公网必须套 HTTPS + 反向代理
+    （Nginx/Caddy），并在代理层附加 IP 白名单或 WAF。
+  - 反向代理不要压缩 JSON-RPC 响应（避免流式帧被缓冲），直接透传。
+  - Token 一定走 HTTPS 传输，不要在明文 HTTP 上过公网。
+
+
+========================================
+第 5 章  工具清单与调用说明（AstrBot 对话中可触发）
+========================================
+
+基础检索工具（5 个，默认全开放）：
+  repo_overview
+    列出所有已配置仓库：短名、分支、HEAD、文件数、符号数、是否可写 issue。
+    模型用它决定下一步查哪个仓。
+
+  search_code(repo, query, k=5, max_chars=12000)
+    BM25 关键字检索源码。返回结果为：命中行预览 + 路径:行号 + 钉住 commit 的
+    permalink。最常用工具；建议模型先问清项目意图后再搜关键词。
+
+  find_symbol(repo, name)
+    按符号名（函数/结构体/类/方法/宏）精确定位。用于已知函数名要找定义的场景。
+    返回：符号类型、签名、定位行范围、permalink、前后几行上下文。
+
+  read_file(repo, path, start_line=1, end_line=200)
+    读取指定文件片段，带行号。模型拿到 search_code 的命中点后，用它读完整函数
+    上下文。不支持越过字节预算，大文件必须分段读。
+
+  git_history(repo, path, count=20)
+    查看某文件或整仓的提交历史：短 sha、作者、时间、摘要。用于判断最后修改
+    时间、找谁改的、关联哪些变更。
+
+Issue 工具（4 个，仅在 repos[*].issues.write=true 且配置了 GitHub PAT 时生效）：
+  search_issues(repo, q, state=open, count=10)
+    GitHub Issue 搜索，q 是普通查询词，支持 label:x author:y 等 GitHub Search
+    语法。模型找重复 issue / 确认是否已有人提过用它。
+
+  get_issue(repo, issue_number)
+    读取单个 issue 的完整正文 + 评论 + 标签 + 状态 + 指派人。
+
+  create_issue(repo, title, body, labels=[], reporter="")
+    代用户提交 issue。body 末尾会自动附加：「由 SantaChains 代 **{报告人}** 提交
+    （repoMcp，索引 commit `xxx`）」作为来源标注，仓库维护者可一眼识别机器人写入。
+    每小时默认最多 5 个新 issue（maxIssueCreatesPerHour）。
+
+  update_issue(repo, issue_number, state=null, comment=null, labels=null,
+               assignees=null, reporter="")
+    改 issue 状态（open/closed）、追加评论、改标签、改指派人。每条机器人评论
+    末尾会附加「由 SantaChains 经 repoMcp 提交」的署名。
+
+
+========================================
+第 6 章  联调验证步骤（做完才算接好）
+========================================
+
+1. 服务端探活 OK：curl <repoMcp>/healthz -> ready=true，所有仓 error=""
+2. 协议握手 OK：mcp_probe.py -> ALL OK，列出的 tools 数量符合预期
+3. AstrBot 连接 OK：WebUI MCP 页 -> repomcp 条目「已连接 / 绿色」
+4. 工具注册 OK：对话里输入工具列表命令，看到 repo_overview / search_code /
+   find_symbol / read_file / git_history（5 个），以及启用 issue 时的
+   search_issues / get_issue / create_issue / update_issue（共 9 个）
+5. 一次最小实测：在 AstrBot 中让机器人去 repo_overview，看是否正确返回各仓信息；
+   再搜一个你代码里一定存在的关键词（如 main），看是否返回带 permalink 的命中；
+   最后试 read_file 读该命中周围几行，验证内容与实际代码一致。
+6. Issue 实测（若开启写入）：
+   先创建一个带 label:question 的测试 issue，标题写「[TEST] repoMcp 联调」，
+   去 GitHub 界面确认 issue 末尾有 SantaChains 署名与索引 commit 号；
+   随后用 update_issue 追加评论，并关闭 issue；回 GitHub 看评论署名与状态变更。
+
+
+========================================
+第 7 章  隐私清单与 Git 边界
+========================================
+
+以下内容严禁提交到任何公开或私有 Git 托管（GitHub / Gitee / GitLab 等）：
+
+  1. config.json
+     - 字段 token 是 AstrBot <-> repoMcp 的共享密钥
+     - 字段 githubToken 是你的 GitHub PAT，泄露可被人读写 issue、读取私有仓
+     - repos[*].url 若内嵌认证信息也属于密钥
+
+  2. astrbot_mcp.json（AstrBot 侧本地实配文件，含 Bearer Token）
+     - 使用时应从 astrbot_mcp.example.json 复制改名再填
+
+  3. data/ 目录
+     - 含有每个仓库的完整本地 clone，可能包含私有代码、历史提交中的密钥
+     - 体积可达 GB 级，不应入库也不应上传任何对象存储
+
+  4. 运行日志（repomcp.log / AstrBot 端 repomcp 工具调用日志）
+     - 可能包含模型输入、代码片段、issue 正文等敏感内容
+
+  5. 编译产物（build/、repomcp、repomcp.exe 等）
+     - 二进制文件不应入库，统一用构建服务器产出或发布包分发
+
+以下内容可以安全传 GitHub（本仓 .gitignore 已正确放行）：
+  - config.example.json       示例模板，全是占位符
+  - astrbot_mcp.example.json  AstrBot 侧示例模板，全是占位符
+  - ASTRBOT_SETUP.txt         说明文档（即本文件）
+  - mcp_probe.py              联调脚本，不含密钥
+  - 所有 Go 源码、README.md、CLAUDE.md、Taskfile.yml、.gitignore
+
+
+========================================
+第 8 章  故障排查
+========================================
+
+8.1 AstrBot 显示连接失败 / 401 Unauthorized
+  原因 1：共享 Token 不一致（最常见）
+    服务端 config.json 的 token 是裸字符串，客户端 headers.Authorization
+    必须是 "Bearer <同样的裸字符串>"，差一个字符都会 401。
+    验证：用 curl 发请求看服务端返回
+      curl -i -X POST http://127.0.0.1:8790/mcp \
+        -H "Authorization: Bearer <Token>" \
+        -H "Content-Type: application/json" \
+        -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
+      正常返回 {"jsonrpc":"2.0","id":1} 或带方法不存在错误但不是 401
+  原因 2：URL 路径错
+    必须带 /mcp；/healthz 是探活端点，不是 MCP 端点。
+
+8.2 AstrBot 连接成功但列表工具为 0 个
+  原因：AstrBot 未同步工具。点 WebUI MCP 页「同步服务器」或重启 AstrBot。
+  如果仍为 0，回看 repoMcp 服务端日志：list_tools 请求是否命中，返回体大小。
+
+8.3 search_code / find_symbol 全部 0 命中
+  原因 1：首次同步没完成。看 /healthz 中该仓 files=0 或 symbols=0 就是未同步。
+  原因 2：exclude glob 写得太宽，把想查的文件都排除了。
+  原因 3：查询词与仓内代码语料不匹配；换关键词、用更通用的词先试。
+  原因 4：语言识别异常；仓里非 .go 的文件（如 Python/JS/TS/Java/C/C++/Rust）
+    也能被索引，但符号（find_symbol）只对这些语言生效；其余语言只有
+    search_code（全文 BM25）能力。
+
+8.4 创建议题时报 "GitHub API 404 / 403"
+  404：repo 不存在或 PAT 没有访问该仓权限；检查 webBase 所指 owner/repo 是否正确。
+  403：PAT 权限不足，需在 GitHub 重发一个带 Issues 读/写的 Fine-grained PAT，
+       或经典 PAT 勾 repo 范围；如果是组织内私有仓可能还需 SSO 授权。
+
+8.5 create_issue 被拒绝："超过每小时创建上限"
+  默认每小时 5 个。调大 maxIssueCreatesPerHour；
+  若只是联调测试可临时设 99，生产环境建议 ≤ 20。
+
+8.6 工具返回体被截断（出现「已省略 N 行」）
+  这是正常行为：消费方 MCP 客户端不截断 tool 返回，由 repoMcp 服务端硬收口。
+  调大 config.json 中 maxResponseBytes（默认 12000，建议最大 50000）；
+  或者让模型把查询拆得更细（分段 read_file、更小的 k 参数）。
+
+8.7 所有工具都报 "repo 不存在"
+  工具参数 repo= 必须严格等于 repos[*].name 字段（区分大小写），
+  不是 GitHub slug、不是目录名。先调用 repo_overview 看模型拿到的短名是什么。
+
+
+========================================
+第 9 章  配置文件清单（本仓相关文件一览）
+========================================
+
+  文件名                       是否入库        作用
+  ------------------------    ------------    ----------------------------------
+  config.example.json         是（已入库）    repoMcp 服务端模板，占位符
+  config.json                 否（.gitignore）repoMcp 服务端实配，含 Token/PAT
+  astrbot_mcp.example.json    是（本文档配套）AstrBot 侧 MCP 配置模板
+  astrbot_mcp.json            否（.gitignore）AstrBot 侧实配，含 Bearer Token
+  ASTRBOT_SETUP.txt           是（本文档）    接入说明
+  mcp_probe.py                是（已入库）    MCP 握手联调脚本
+  data/                       否（.gitignore）本地 clone 目录
+  build/                      否（.gitignore）编译产物
+
+使用流程（最快上手路径）：
+  1. cp config.example.json config.json ，填真实 Token / PAT / 仓库列表
+  2. go run . -config config.json ，等待同步完成；curl /healthz 检查
+  3. （可选）python mcp_probe.py 协议层联调
+  4. cp astrbot_mcp.example.json astrbot_mcp.json，填 URL + Token
+  5. AstrBot WebUI -> MCP -> 新增服务器 -> 粘贴 astrbot_mcp.json 内容
+  6. 测试连接 -> 同步服务器 -> 进入对话实测最小用例

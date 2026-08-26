@@ -1,4 +1,253 @@
+# ============================================================
+# 操作系统生成文件
+# ============================================================
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+
+# ============================================================
+# Go 语言
+# ============================================================
+# 编译产物
 build/
-data/
-config.json
 *.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+*.out
+
+# 测试与覆盖率
+*.test
+*.out
+coverage.out
+coverage.html
+cover.out
+cover.profile
+
+# 二进制
+repomcp
+repomcp.exe
+
+# Go workspace（多仓本地开发）
+go.work
+go.work.sum
+
+# 供应商目录（若使用 vendor 管理依赖请删除此行）
+vendor/
+
+
+# ============================================================
+# Python（探针脚本）
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.manifest
+*.spec
+pythonenv*
+venv/
+env/
+ENV/
+.venv/
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+
+
+# ============================================================
+# 编辑器 / IDE
+# ============================================================
+# Visual Studio Code（保留项目级 settings.json 时可手动解除忽略）
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+# JetBrains 全家桶（GoLand / IDEA / PyCharm / WebStorm 等）
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+*.log
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Vim / Neovim
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+Session.vim
+Sessionx.vim
+.netrwhist
+*~
+tags
+[._]*.un~
+.viminfo
+.nviminfo
+.neoconf.json
+.neoconf/
+.idea/
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# Helix
+.helix/
+
+# Zed
+.zed/
+
+# Kate / KDevelop
+*.kate-swp
+.ctags
+
+
+# ============================================================
+# AI 编码助手
+# ============================================================
+# Trae
+.trae/
+.trae-cn/
+
+# Cursor
+.cursor/
+.cursorrules
+.cursortheme
+.cursorignore
+
+# Windsurf（Codeium）
+.windsurf/
+.codeium/
+
+# Continue.dev
+.continue/
+
+# Aider（终端 AI 结对编程）
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v3
+.aider.model.settings.yml
+.aider/
+
+# PearAI
+.pearai/
+
+# Tabnine
+.tabnine/
+.tabnine*
+
+# Sourcegraph Cody / Embeddings 缓存
+.sourcegraph-embeddings/
+
+# OpenHands / OpenDevin 工作区
+.openhands/
+.opendevin/
+
+# Devin
+.devin/
+
+# Loop
+.loop/
+
+# 各类 AI 助手的本地会话与日志缓存
+.ai/
+.ai-workspace/
+.aihistory/
+.ai_assist/
+.llm_cache/
+
+
+# ============================================================
+# 文件历史 / 备份
+# ============================================================
+# 通用历史目录（VSCode Local History 插件、旧版编辑器、自定义备份工具等）
+.history/
+.history_*/
+.revisions/
+.filehistory/
+
+# 备份文件
+*.bak
+*.backup
+*.old
+*.orig
+*.tmp
+*.temp
+
+
+# ============================================================
+# 项目本地配置
+# ============================================================
+# 本地 clone 存放目录（由配置 dataDir 指定，默认 ./data）
+data/
+
+# 本地个人配置（含 token / GitHub PAT，严禁入库）
+config.json
+astrbot_mcp.json
+*.local.json
+
+# 日志
+*.log
+logs/
+
+# OpenMemory - IDE/Assistant specific rules
+CLAUDE.md
