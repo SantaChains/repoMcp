@@ -275,12 +275,12 @@ func stIsGitRepo(ctx context.Context, dir string) bool {
 	return err == nil
 }
 
-// stClone 全新克隆到 r.Dir。
+// stClone 全新克隆到 r.Dir。首次只需工作树，历史留给后续 fetch 按需拉。
 func (s *Store) stClone(ctx context.Context, r *Repo) error {
 	if err := os.MkdirAll(filepath.Dir(r.Dir), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
-	args := []string{"clone", "--depth", "200", "--single-branch"}
+	args := []string{"clone", "--depth", "1", "--single-branch", "--no-tags", "--progress=false"}
 	if r.Ref != "" {
 		args = append(args, "--branch", r.Ref)
 	}
@@ -289,13 +289,13 @@ func (s *Store) stClone(ctx context.Context, r *Repo) error {
 	return err
 }
 
-// stPull 增量拉取并把工作树强制对齐远端。
+// stPull 增量拉取并把工作树强制对齐远端。浅拉 50 层足够 git_blame / git_history 默认展示。
 func (s *Store) stPull(ctx context.Context, r *Repo) error {
 	ref := r.Ref
 	if ref == "" {
 		ref = "HEAD"
 	}
-	if _, err := stRunGit(ctx, r.Dir, "fetch", "--depth", "200", "origin", ref); err != nil {
+	if _, err := stRunGit(ctx, r.Dir, "fetch", "--depth", "50", "--no-tags", "origin", ref); err != nil {
 		return err
 	}
 	if _, err := stRunGit(ctx, r.Dir, "reset", "--hard", "FETCH_HEAD"); err != nil {

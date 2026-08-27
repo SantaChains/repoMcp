@@ -63,6 +63,9 @@ type Server struct {
 	lastSyncDur  time.Duration // 最近一次同步实际耗时
 	lastSyncEnd  time.Time     // 最近一次同步结束时刻（UTC）
 	nextSchedule time.Time     // 下次定时同步的计划时刻（UTC）
+
+	instMu       sync.RWMutex
+	instCache    string // 启动时与每次同步后重建一次，MCP initialize 直接返回缓存字符串。
 }
 
 // ---- singleflight：避免 /sync 被并发请求触发多次同步 ----
@@ -192,6 +195,7 @@ func main() {
 		limiter:       newIssueRateLimiter(cfg.issueLimit),
 		sf:            &singleFlight{m: make(map[string]*sfCall)},
 	}
+	srv.rebuildInstructions()
 	CheckFilePermission(*flagCfgPath, log.Printf)
 	logIssueSetup(repos, cfg)
 
@@ -357,10 +361,9 @@ func (s *Server) syncLoop(ctx context.Context) {
 	}
 }
 
-// syncOnce 拉取远端并重建索引。单仓失败被隔离：其余仓库照常索引。
+// syncOnce 拉取远端并重建索引。仓间并行，耗时 ≈ max(各仓索引) 而非累加。
 func (s *Server) syncOnce(ctx context.Context) {
 	repos := s.store.Repos()
-	// 每仓一份 git 超时预算，外加一份余量，避免慢仓拖垮整轮同步。
 	deadline := s.cfg.gitTimeout * time.Duration(len(repos)+1)
 	syncCtx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
@@ -370,28 +373,50 @@ func (s *Server) syncOnce(ctx context.Context) {
 		log.Printf("同步存在失败：%v", err)
 	}
 
-	for _, r := range repos {
-		if syncCtx.Err() != nil {
-			log.Printf("同步超时，剩余仓库本轮跳过")
-			break
-		}
-		t0 := time.Now()
-		files, err := s.store.Load(r)
-		if err != nil {
-			log.Printf("加载 %s 失败：%v", r.Name, err)
+	// Load + Replace 仓间并行。index.Replace 是快照替换，RWMutex 保护，天然并发安全。
+	type idxResult struct {
+		name  string
+		files []File
+		dur   time.Duration
+		err   error
+		head  string
+	}
+	results := make([]idxResult, len(repos))
+	var wg sync.WaitGroup
+	for i, r := range repos {
+		wg.Add(1)
+		go func(i int, r *Repo) {
+			defer wg.Done()
+			if syncCtx.Err() != nil {
+				results[i].err = syncCtx.Err()
+				return
+			}
+			t0 := time.Now()
+			files, err := s.store.Load(r)
+			results[i] = idxResult{name: r.Name, files: files, dur: time.Since(t0), err: err, head: s.store.Head(r.Name)}
+			if err == nil {
+				s.index.Replace(r.Name, files)
+			}
+		}(i, r)
+	}
+	wg.Wait()
+
+	for _, res := range results {
+		if res.err != nil {
+			log.Printf("加载 %s 失败：%v", res.name, res.err)
 			continue
 		}
-		s.index.Replace(r.Name, files)
-		st := s.index.Stats()[r.Name]
+		st := s.index.Stats()[res.name]
 		log.Printf("已索引 %s @%s：%d 文件 / %d 行 / %d 符号（%s）",
-			r.Name, shortSHA(s.store.Head(r.Name)), st.Files, st.Lines, st.Symbols,
-			time.Since(t0).Round(time.Millisecond))
+			res.name, shortSHA(res.head), st.Files, st.Lines, st.Symbols,
+			res.dur.Round(time.Millisecond))
 	}
 	dur := time.Since(started)
 	log.Printf("本轮同步完成，耗时 %s", dur.Round(time.Millisecond))
 	s.statsMu.Lock()
 	s.lastSyncDur = dur
 	s.lastSyncEnd = time.Now().UTC()
+	s.rebuildInstructions()
 	s.statsMu.Unlock()
 }
 

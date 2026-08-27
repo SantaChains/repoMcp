@@ -367,10 +367,11 @@ func (s *Server) initializeResult(params json.RawMessage) map[string]any {
 	}
 }
 
-// instructions 会被客户端注入到系统提示。IM 场景的小模型很依赖它来正确编排工具。
-func (s *Server) instructions() string {
+// rebuildInstructions 启动时与每次同步后调用一次，构建并缓存 system instructions。
+// MCP initialize 直接返回缓存字符串，避免每次握手重新拼接。
+func (s *Server) rebuildInstructions() {
 	var b strings.Builder
-	b.WriteString("本服务可检索以下已索引仓库的源码，用于回答代码相关问题。\n\n可用仓库（repo 参数取这些短名）：\n")
+	b.WriteString("本服务可检索以下仓库的源码，用于回答代码相关问题。\n\n可用仓库（repo 参数取这些短名）：\n")
 	for _, r := range s.store.Repos() {
 		b.WriteString("  - " + r.Name)
 		if d := s.cfg.desc(r.Name); d != "" {
@@ -385,30 +386,35 @@ func (s *Server) instructions() string {
 		b.WriteString("\n")
 	}
 	b.WriteString(`
-使用要求：
+使用规则：
 1. 涉及代码的问题必须先检索再回答，禁止凭记忆臆测实现细节。
 2. 不清楚仓库结构时先调用 repo_overview 建立坐标，再检索。
 3. 已知符号名（函数/类型/类）用 find_symbol；描述性问题用 search_code；
    要看完整实现用 read_file；问"为何这样改"用 git_history。
-4. 回答必须引用来源，格式为 路径:行号，并附检索结果给出的链接。
-5. 检索无结果时如实说明未找到，不要编造代码。
+4. 回答必须引用来源：格式为 路径:行号，并附检索结果给出的 permalink 链接。
+5. 检索无结果时如实说明未找到，不要编造代码或引用。
 `)
-	if len(s.issueRepos(false)) > 0 {
-		b.WriteString(`
-issue 相关要求（只对上面标注了 issue 能力的仓库有效）：
-6. 用户问「有没有人提过 / 这个功能什么进度」→ search_issues；要看细节与结论 → read_issue。
-7. 能靠检索代码直接回答的问题就直接回答，不要开 issue。issue 只用于缺陷、异常与功能需求。
-`)
-	}
 	if len(s.issueRepos(true)) > 0 {
-		b.WriteString(`8. 提交 issue 前必须两步齐全：先用 search_code / find_symbol 调研，再用 search_issues(state=all) 查重。
-   调研结论无论「已确认」还是「未能确认」都要如实写进 create_issue 的 confidence 与 evidence，不要编造出处。
-9. 一个问题只提一次。补充信息用 update_issue 追加评论，不要另开新 issue。
-10. 不要主动关闭 issue。只有用户明确要求、或问题确已解决时才 close，并写清结论。
-11. 写操作前先确认仓库对得上：把问题提到与之无关的仓库比不提更糟。
+		b.WriteString(`
+issue 写操作（只对标注了"可写"的仓库生效）：
+6. 提交 issue 前必须两步齐全：先用 search_code / find_symbol 调研，
+   再用 search_issues(state=all) 查重。调研结论无论确认与否都要如实写入
+   confidence 与 evidence，不要编造出处。
+7. 一个问题只提一次。补充信息用 update_issue 追加评论，不要另开新 issue。
+   不要主动关闭 issue——只有用户明确要求、或问题确已解决时才 close，并写清结论。
 `)
 	}
-	return b.String()
+	s.instMu.Lock()
+	s.instCache = b.String()
+	s.instMu.Unlock()
+}
+
+// instructions 返回缓存的 system instructions。MCP initialize 握手时调用，
+// 客户端会把它注入到 LLM 的系统提示。
+func (s *Server) instructions() string {
+	s.instMu.RLock()
+	defer s.instMu.RUnlock()
+	return s.instCache
 }
 
 // handleRoot 兜底根路径。MCP 客户端配置里只填域名、漏掉 /mcp 是极常见的操作，
