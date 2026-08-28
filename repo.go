@@ -280,7 +280,7 @@ func (s *Store) stClone(ctx context.Context, r *Repo) error {
 	if err := os.MkdirAll(filepath.Dir(r.Dir), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
-	args := []string{"clone", "--depth", "1", "--single-branch", "--no-tags", "--progress=false"}
+	args := []string{"clone", "--depth", "1", "--single-branch", "--no-tags"}
 	if r.Ref != "" {
 		args = append(args, "--branch", r.Ref)
 	}
