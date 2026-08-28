@@ -213,6 +213,46 @@ curl -s -X POST -H "Authorization: Bearer <token>" \
 
 机器人提交的 issue/评论带来源标注（提交人 + repoMcp + 索引 commit）。
 
+## PR 护栏
+
+PR 写入（create_pull / merge_pull）风险远高于 issue，配置里没 `issues.write: true` 不挂载写工具。读工具（list_pulls / get_pull）随 IssueRead 同步可用。
+
+| 护栏 | 行为 |
+|---|---|
+| 分支名合法校验 | 正则 `^[a-z0-9][a-z0-9._/-]*[a-z0-9]$`，禁 `..`、前缀 `.`、后缀 `/` 或 `.lock` |
+| 基线分支保护 | head 不能是 main / master / production / release-* / hotfix-* / stable*，防止模型把保护分支作为 head 提 PR |
+| head == base 拒绝 | 源分支与目标分支相同立即拒绝 |
+| title / body 封顶 | title 10–300 字；body 20–16000 字（PR 正文允许比 issue 更长，因为要带改动摘要 + 测试证据） |
+| 同 head→base 查重 | 创建前 ListPulls 查最近 40 条 open PR，同一 head→base 对立即拒绝并列已有 PR 编号 |
+| 限频共享 | create_pull 与 create_issue 共用 issueRateLimiter（repo/global/reporter 三层），PR 写配额与 issue 同用 |
+| state=merged 语义修正 | GitHub REST 没 merged 状态，自动转换为 state=closed 再做已合并过滤 |
+| head SHA 合并保护 | merge_pull 必须给 hex sha（8–40 位），合并前重新 GetPull 拉最新 head_sha 做 HasPrefix 精确匹配——不一致直接拒绝；实际传给 GitHub 的是**完整 HeadSHA**，不是用户填的短 SHA |
+| 强制 squash | MergePull 的 merge_method 固定为 `squash`，禁止模型选 merge-commit / rebase，保证历史干净；commit_title / commit_body 可空，空时自动合成 `Merge PR #n: <title>` + 溯源注释 + PR 作者标注 |
+| 合并后刷新 | squash 成功后 sleep 1s，保证模型下一步 get_pull 时已刷新成 merged 状态 |
+
+代提交签名：create_pull 和 merge_pull 的正文 / commit message 末尾附 SantaChains repoMcp 代提交来源说明。
+
+## 常见错误解码
+
+工具层错误会直接进模型上下文，关键 403 已按 GitHub 返回值分 5 类（不再硬编码成"token 缺 issues:write"）：
+
+| 错误模板 | 含义 | 解决 |
+|---|---|---|
+| `GitHub 接口限流（403），hh:mm UTC 后恢复` | X-RateLimit-Remaining=0，primary rate limit | 等 reset；减少并行工具调用 |
+| `GitHub 次级限流（403 secondary）…Retry-After …` | body 含 secondary rate limit / abuse detection | 按 Retry-After 排队，不要再点重试 |
+| `令牌 scope 不足…missing_scope` | Classic 没勾 `public_repo` / `repo`，或 fine-grained 没勾 Issues Read+write / Pull requests Read+write | 换 PAT，按「GitHub Token 权限」章节重新配 |
+| `令牌无权访问 owner/repo——需 collaborator` | body 含 Resource not accessible / collaborator / not have access | 自己的仓直接邀请；他人仓选 Classic `public_repo`（公开仓 issue 免 collaborator） |
+| `owner/repo 操作被拒绝。…` | 其他 GitHub 403（封禁、DMCA、IP 限制等） | 看原始 body 后半段原文 |
+
+写入工具（create_issue / update_issue / create_pull / merge_pull）常见 422：
+
+| 场景 | 典型原因 |
+|---|---|
+| create_issue 422 Validation Failed | title 空 / URL 解析错 slug / 仓 has_issues=false 已关闭 issue 功能 |
+| create_pull 422 No commits between `a` and `b` | head 分支未推送远端，或与 base 完全相同 |
+| create_pull 422 A pull request already exists for `a:b` → `c` | 与护栏查重相同，只是 GitHub 侧先命中 |
+| merge_pull 422 Merge Conflict / Required status check | 有冲突没解决；或仓开启了 Required checks 未通过 |
+
 ## 安全
 
 - Bearer 用 `crypto/subtle.ConstantTimeCompare` 比较
@@ -260,16 +300,16 @@ uv run --with mcp --with httpx --with anyio python mcp_probe.py
 
 深度对比同类 [RepoMCP（Python 版）](https://github.com/areeb1501/RepoMCP)。Python 版走**纯 GitHub REST API** 路线：1915 行单文件、6 依赖（fastapi/fastmcp/pydantic/requests/uvicorn/python-dotenv）、单仓硬编码、Vercel 可部署。本项目坚持**本地 git + BM25**，理由：BM25 质量远高于 GitHub Search（CJK 差、60 次/分钟限流）、可做符号抽取、离线可用、不依赖 API 配额。
 
-### P1：补原始功能 + 轻量扩展（易实现）
+### P1：补原始功能 + 轻量扩展
 
-| 功能 | 来源 | 实现路径 |
-|---|---|---|
-| `tools_pulls.go`（list/get/create PR） | 原始项目有、改版丢失 | GitHub REST，与现有 issue.go 同级，约 300 行 |
-| `get_diff`（两分支/两 commit） | Python RepoMCP `get_diff` | `git diff branch1..branch2 --stat` |
-| `get_commit`（单 commit 详情） | Python RepoMCP `get_commit` | `git show --stat --format=fuller <sha>` |
-| `list_branches` | Python RepoMCP `list_branches` | `git branch -a` 本地 |
-| `search_file_contents`（正则模式） | Python RepoMCP `search_file_contents` | 已索引文件 + Go `regexp` 匹配，与 BM25 并行召回 |
-| MCP prompts 端点（3–5 预定义模板） | Python RepoMCP `show_common_workflows` | `prompts/list` 从空返回 issue 调研流程 / PR 检查清单 / 代码定位流程模板 |
+| 功能 | 状态 | 来源 | 实现路径 |
+|---|---|---|---|
+| `tools_pulls.go`（list/get/create/merge PR，10 类护栏） | ✅ 已完成（2026-08） | 原始项目有、改版丢失 | GitHub REST，与 tools_issues.go 同级，含 isSecondaryRateLimit + 403 细分错误 |
+| `get_diff`（两分支 / 两 commit 统计） | 🔲 未开始 | Python RepoMCP `get_diff` | `git diff branch1..branch2 --stat` |
+| `get_commit`（单 commit 详情） | 🔲 未开始 | Python RepoMCP `get_commit` | `git show --stat --format=fuller <sha>` |
+| `list_branches` | 🔲 未开始 | Python RepoMCP `list_branches` | `git branch -a` 本地 |
+| `search_file_contents`（正则模式） | 🔲 未开始 | Python RepoMCP `search_file_contents` | 已索引文件 + Go `regexp` 匹配，与 BM25 并行召回 |
+| MCP prompts 端点（3–5 预定义模板） | 🔲 未开始 | Python RepoMCP `show_common_workflows` | `prompts/list` 返回 issue 调研流程 / PR 检查清单 / 代码定位流程 |
 
 ### P2：写能力
 
