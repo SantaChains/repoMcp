@@ -30,6 +30,15 @@ IM 机器人 / MCP 客户端的仓库源码检索与 issue 管理服务。让 LL
 | `create_issue` | 代用户提交，正文服务端按模板渲染 | `issues.write: true` |
 | `update_issue` | 追加评论、关闭/重开、增删标签 | 同上 |
 
+**Pull Request（issue 读写能力同步挂载）**
+
+| 工具 | 用途 | 前提 |
+|---|---|---|
+| `list_pulls` | 按状态/head/base 过滤列出 PR | `repos[].issues` 已配（IssueRead） |
+| `get_pull` | PR 详情 + 文件级 diff 摘要 | 同上 |
+| `create_pull` | 把 head 分支合到 base 分支，强制同 head→base 查重 | `issues.write: true` |
+| `merge_pull` | 以 squash 方式合并，**必须传当前 head_sha** 防止吞未预期提交 | 同上 |
+
 initialize 握手时下发 instructions：可用仓库清单、各仓 issue 能力、工具选择规则，要求回答必须引用来源、检索无果不得编造。
 
 ## 配置
@@ -242,7 +251,7 @@ uv run --with mcp --with httpx --with anyio python mcp_probe.py
 | 多仓同步 | 串行 | goroutine 并行，耗时 ≈ max(各仓) |
 | git clone | `--depth 200` | `--depth 1` 首次，`--depth 50` 增量 |
 | 指令词缓存 | 每次 initialize 重新拼接 | 启动 + 同步后重建，initialize 零分配 |
-| 工具数量 | 5 检索 + 4 issue + PR | 5 检索 + 4 issue（PR 工具暂未恢复） |
+| 工具数量 | 5 检索 + 4 issue + PR | 5 检索 + 4 issue + 4 PR |
 | 配置校验 | 弱校验 | 11 项强校验 + -check-config / -print-config |
 | issue 限频 | 单仓每小时 | 单仓 + 全局 + reporter 三层 |
 | LICENSE | 无 | MIT（双版权） |

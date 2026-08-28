@@ -165,8 +165,8 @@ type Storer interface {
 	Blame(ctx context.Context, repo, path string, start, end int) ([]BlameLine, error)
 }
 
-// IssueTracker 是 issue 层对外契约，由 *GitHub 实现。实现必须并发安全。
-// 契约刻意不含任何删除操作：本服务对仓库的写权力上限就是建 issue / 评论 / 改状态与标签。
+// IssueTracker 是 issue 与 PR 层对外契约，由 *GitHub 实现。实现必须并发安全。
+// 契约刻意不含任何删除端点：本服务对仓库的写权力上限就是建 issue/PR / 评论 / 改状态与标签。
 type IssueTracker interface {
 	List(ctx context.Context, r *Repo, q IssueQuery) ([]Issue, error)
 	// Get 返回 issue 正文与最近若干条评论。
@@ -176,4 +176,54 @@ type IssueTracker interface {
 	Edit(ctx context.Context, r *Repo, number int, e IssueEdit) (Issue, error)
 	// RepoLabels 返回仓库现有标签，用于拦截模型编造的标签。
 	RepoLabels(ctx context.Context, r *Repo) ([]string, error)
+
+	// ── PR 读取 ──
+	// ListPulls 按 state 列出 PR。state ∈ {open, closed, all}，空视为 open。
+	ListPulls(ctx context.Context, r *Repo, state, head, base string, limit int) ([]Pull, error)
+	// GetPull 返回 PR 详情（正文含 300 行内 diff 摘要）。
+	GetPull(ctx context.Context, r *Repo, number int) (Pull, error)
+	// ── PR 写入 ──
+	CreatePull(ctx context.Context, r *Repo, head, base, title, body string) (Pull, error)
+	// MergePull 合并 PR。仅支持 squash（干净历史，避免合并提交），
+	// commit 为空时按 "Merge PR #n: title" 生成。sha 必须是当前 head，防止合并未预期的提交。
+	MergePull(ctx context.Context, r *Repo, number int, sha, commitMsg string) (PullMergeResult, error)
+}
+
+// Pull 是一条 Pull Request。Body 已把 CRLF 规整为 LF。
+type Pull struct {
+	Number      int
+	Title       string
+	State       string // open / closed / merged
+	Author      string
+	HeadRef     string // 源分支
+	BaseRef     string // 目标分支
+	HeadSHA     string
+	Additions   int
+	Deletions   int
+	Commits     int
+	Files       int
+	Labels      []string
+	Comments    int
+	CreatedAt   string
+	UpdatedAt   string
+	URL         string
+	Body        string
+	// DiffSummary 是文件级差异摘要（path ±lines），仅 GetPull 时填充。
+	DiffSummary []PullFile
+}
+
+// PullFile 是单个文件的 diff 摘要行，输出紧凑供模型快速感知改动面。
+type PullFile struct {
+	Path      string
+	Status    string // added / modified / removed / renamed
+	Additions int
+	Deletions int
+	Previous  string // renamed 时的旧路径
+}
+
+// PullMergeResult 是合并结果。SHA 空时 GitHub 返回非 2xx，Merged=false。
+type PullMergeResult struct {
+	Merged bool
+	SHA    string // 合并生成的提交 sha（squash merge 时是 squash commit）
+	Message string
 }

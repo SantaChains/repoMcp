@@ -557,3 +557,189 @@ func ghRankByText(items []Issue, text string, limit int) []Issue {
 	}
 	return out
 }
+
+// ── Pull Request ──────────────────────────────────────────────
+
+type ghPullJSON struct {
+	Number      int       `json:"number"`
+	Title       string    `json:"title"`
+	State       string    `json:"state"` // open / closed
+	Merged      bool      `json:"merged"`
+	Body        string    `json:"body"`
+	HTMLURL     string    `json:"html_url"`
+	Comments    int       `json:"comments"`
+	Additions   int       `json:"additions"`
+	Deletions   int       `json:"deletions"`
+	Commits     int       `json:"commits"`
+	ChangedFiles int      `json:"changed_files"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	MergeCommitSHA *string `json:"merge_commit_sha"`
+	User        struct {
+		Login string `json:"login"`
+	} `json:"user"`
+	Head struct {
+		Label string `json:"label"`
+		Ref   string `json:"ref"`
+		SHA   string `json:"sha"`
+	} `json:"head"`
+	Base struct {
+		Label string `json:"label"`
+		Ref   string `json:"ref"`
+		SHA   string `json:"sha"`
+	} `json:"base"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
+}
+
+type ghPullFileJSON struct {
+	Filename  string `json:"filename"`
+	Status    string `json:"status"` // added/modified/removed/renamed
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	Previous  string `json:"previous_filename,omitempty"`
+}
+
+func (j ghPullJSON) toPull() Pull {
+	state := j.State
+	if j.Merged {
+		state = "merged"
+	}
+	out := Pull{
+		Number:    j.Number,
+		Title:     strings.TrimSpace(j.Title),
+		State:     state,
+		Author:    j.User.Login,
+		HeadRef:   j.Head.Ref,
+		BaseRef:   j.Base.Ref,
+		HeadSHA:   j.Head.SHA,
+		Additions: j.Additions,
+		Deletions: j.Deletions,
+		Commits:   j.Commits,
+		Files:     j.ChangedFiles,
+		Comments:  j.Comments,
+		URL:       j.HTMLURL,
+		Body:      strings.ReplaceAll(j.Body, "\r\n", "\n"),
+	}
+	if !j.CreatedAt.IsZero() {
+		out.CreatedAt = j.CreatedAt.UTC().Format("2006-01-02")
+	}
+	if !j.UpdatedAt.IsZero() {
+		out.UpdatedAt = j.UpdatedAt.UTC().Format("2006-01-02")
+	}
+	for _, l := range j.Labels {
+		if l.Name != "" {
+			out.Labels = append(out.Labels, l.Name)
+		}
+	}
+	return out
+}
+
+// ListPulls 返回 PR 列表。state 走 ghNormState；head/base 过滤可选。
+func (g *GitHub) ListPulls(ctx context.Context, r *Repo, state, head, base string, limit int) ([]Pull, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	v := url.Values{}
+	v.Set("state", ghNormState(state))
+	v.Set("per_page", strconv.Itoa(limit))
+	v.Set("sort", "updated")
+	v.Set("direction", "desc")
+	if head != "" {
+		v.Set("head", head)
+	}
+	if base != "" {
+		v.Set("base", base)
+	}
+	var raw []ghPullJSON
+	if err := g.do(ctx, r, http.MethodGet, "/repos/"+r.Slug+"/pulls?"+v.Encode(), nil, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]Pull, 0, len(raw))
+	for _, j := range raw {
+		out = append(out, j.toPull())
+	}
+	return out, nil
+}
+
+// GetPull 返回 PR 详情 + 文件级 diff 摘要（最多 100 文件，够用）。
+func (g *GitHub) GetPull(ctx context.Context, r *Repo, number int) (Pull, error) {
+	base := fmt.Sprintf("/repos/%s/pulls/%d", r.Slug, number)
+	var j ghPullJSON
+	if err := g.do(ctx, r, http.MethodGet, base, nil, &j); err != nil {
+		return Pull{}, err
+	}
+	p := j.toPull()
+
+	// 最多 100 份文件摘要（changed_files 往往不超过这个数）。
+	v := url.Values{}
+	v.Set("per_page", "100")
+	var files []ghPullFileJSON
+	if err := g.do(ctx, r, http.MethodGet, base+"/files?"+v.Encode(), nil, &files); err == nil {
+		p.DiffSummary = make([]PullFile, 0, len(files))
+		for _, f := range files {
+			p.DiffSummary = append(p.DiffSummary, PullFile{
+				Path:      f.Filename,
+				Status:    f.Status,
+				Additions: f.Additions,
+				Deletions: f.Deletions,
+				Previous:  f.Previous,
+			})
+		}
+	}
+	return p, nil
+}
+
+// CreatePull 新建 PR。PR 一旦不存在 head/base，GitHub 会返回 422，错误由 ghError 翻译。
+func (g *GitHub) CreatePull(ctx context.Context, r *Repo, head, base, title, body string) (Pull, error) {
+	payload := map[string]any{
+		"title": title,
+		"head":  head,
+		"base":  base,
+		"body":  body,
+		"maintainer_can_modify": true,
+	}
+	var j ghPullJSON
+	if err := g.do(ctx, r, http.MethodPost, "/repos/"+r.Slug+"/pulls", payload, &j); err != nil {
+		return Pull{}, err
+	}
+	return j.toPull(), nil
+}
+
+// MergePull 以 squash 方式合并。mergeModes 在所有 GitHub 仓默认支持 squash，
+// 即使仓级禁用了 merge/rebase，squash 通常还允许——这是故意只留 squash 的原因。
+func (g *GitHub) MergePull(ctx context.Context, r *Repo, number int, sha, commitMsg string) (PullMergeResult, error) {
+	if number <= 0 {
+		return PullMergeResult{}, fmt.Errorf("PR 编号非法")
+	}
+	payload := map[string]any{
+		"merge_method": "squash",
+	}
+	if sha != "" {
+		// GitHub 强制要求：指定 sha 时必须精确等于 pull.head.sha，否则拒绝合并。
+		// 这是合并护栏最关键的一步，防止中间新提交被吞。
+		payload["sha"] = sha
+	}
+	if strings.TrimSpace(commitMsg) != "" {
+		payload["commit_message"] = commitMsg
+	}
+
+	var resp struct {
+		SHA     string `json:"sha"`
+		Merged  bool   `json:"merged"`
+		Message string `json:"message"`
+	}
+	base := fmt.Sprintf("/repos/%s/pulls/%d/merge", r.Slug, number)
+	if err := g.do(ctx, r, http.MethodPut, base, payload, &resp); err != nil {
+		return PullMergeResult{}, err
+	}
+	return PullMergeResult{
+		Merged:  resp.Merged,
+		SHA:     resp.SHA,
+		Message: strings.TrimSpace(resp.Message),
+	}, nil
+}
