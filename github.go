@@ -174,6 +174,15 @@ func (g *GitHub) do(ctx context.Context, r *Repo, method, path string, in, out a
 	return nil
 }
 
+// isSecondaryRateLimit 识别 GitHub 次级限流 403：响应体包含 secondary 关键字。
+// 此时 X-RateLimit-Remaining 通常 > 0，所以不能用 remaining==0 判断。
+func isSecondaryRateLimit(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "secondary rate limit") ||
+		strings.Contains(m, "abuse detection") ||
+		strings.Contains(m, "too many requests")
+}
+
 // ghError 把 HTTP 错误翻译成可操作的中文说明。错误文本会直接进模型上下文，
 // 因此必须指出「该改配置」还是「该换参数」，而不是只回一个状态码。
 func ghError(resp *http.Response, raw []byte, r *Repo) error {
@@ -204,14 +213,30 @@ func ghError(resp *http.Response, raw []byte, r *Repo) error {
 	case http.StatusUnauthorized:
 		return fmt.Errorf("GitHub 拒绝令牌（401）：githubToken 无效或已过期。%s", msg)
 	case http.StatusForbidden:
-		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
-			reset := "稍后"
+		reset := func() string {
 			if v, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); err == nil {
-				reset = time.Unix(v, 0).UTC().Format("15:04 UTC")
+				return time.Unix(v, 0).UTC().Format("15:04 UTC")
 			}
-			return fmt.Errorf("GitHub 接口限流（403），%s 后恢复。%s", reset, msg)
+			return "稍后"
 		}
-		return fmt.Errorf("GitHub 拒绝本次操作（403）：令牌对 %s 缺少所需权限（写 issue 需要 issues:write）。%s", r.Slug, msg)
+		switch {
+		case resp.Header.Get("X-RateLimit-Remaining") == "0":
+			return fmt.Errorf("GitHub 接口限流（403），%s 后恢复。%s", reset(), msg)
+		case isSecondaryRateLimit(msg):
+			after := resp.Header.Get("Retry-After")
+			if after == "" {
+				after = reset()
+			}
+			return fmt.Errorf("GitHub 次级限流（403 secondary）：请求过于密集，等待 %s 再试。%s", after, msg)
+		case strings.Contains(msg, "missing_scope") || strings.Contains(strings.ToLower(msg), "scope"):
+			return fmt.Errorf("GitHub 拒绝（403）：令牌 scope 不足，对 %s 缺少必需 scope。%s", r.Slug, msg)
+		case strings.Contains(msg, "Resource not accessible") ||
+			strings.Contains(strings.ToLower(msg), "collaborator") ||
+			strings.Contains(strings.ToLower(msg), "not have access"):
+			return fmt.Errorf("GitHub 拒绝（403）：令牌无权访问 %s——账号需为该仓 collaborator 或有写权限。%s", r.Slug, msg)
+		default:
+			return fmt.Errorf("GitHub 拒绝（403）：%s 操作被拒绝。%s", r.Slug, msg)
+		}
 	case http.StatusNotFound:
 		return fmt.Errorf("%w（404）：目标在 %s 中找不到——issue 编号不存在，或仓库已改名、令牌无权访问。%s", errGHNotFound, r.Slug, msg)
 	case http.StatusGone:

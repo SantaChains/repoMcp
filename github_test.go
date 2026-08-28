@@ -119,6 +119,37 @@ func TestGHError(t *testing.T) {
 	if err := ghError(mkResp(403, rl), []byte(`{}`), r); err == nil || !strings.Contains(err.Error(), "限流") {
 		t.Errorf("403 限流报错应提示限流: %v", err)
 	}
+
+	// ── 403 分类细分 ──
+	hdrOK := http.Header{} // remaining > 0，不是 primary 限流
+	hdrOK.Set("X-RateLimit-Remaining", "10")
+	cases := []struct {
+		name    string
+		body    string
+		wantKey string // 期望错误文本包含
+	}{
+		{"secondary", `{"message":"You have exceeded a secondary rate limit"}`, "次级限流"},
+		{"abuse", `{"message":"Maximum number of requests exceeded due to abuse detection"}`, "次级限流"},
+		{"missing_scope", `{"message":"Insufficient OAuth scope to perform this action","errors":[{"code":"missing_scope"}]}`, "scope"},
+		{"collab_access", `{"message":"Resource not accessible by integration"}`, "无权访问"},
+		{"collaborator_check", `{"message":"You must be a collaborator to do this"}`, "无权访问"},
+		{"default_403", `{"message":"Some other 403 reason"}`, "操作被拒绝"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := ghError(mkResp(403, hdrOK), []byte(c.body), r)
+			if err == nil {
+				t.Fatal("预期返回错误，got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantKey) {
+				t.Errorf("错误应包含 %q，got: %v", c.wantKey, err)
+			}
+			// 关键：不再误导为"缺 issues:write"
+			if strings.Contains(err.Error(), "issues:write") {
+				t.Errorf("403 %s 不应硬编码 issues:write 提示，got: %v", c.name, err)
+			}
+		})
+	}
 }
 
 func TestToIssue(t *testing.T) {
