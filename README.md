@@ -132,28 +132,37 @@ task build                        # 交叉编译 linux-amd64 到 build/repomcp
 
 ## 接入 MCP 客户端
 
-客户端的 MCP 配置里新增一个 HTTP server：
+### AstrBot（推荐）
+
+打开 AstrBot 管理后台 → 扩展 → MCP（通常是 `http://localhost:6185/#/extension/mcp`）→ 新增服务器，粘贴以下配置：
 
 ```json
 {
-  "name": "repo",
-  "mode": "http",
+  "name": "repomcp",
+  "transport": "streamable_http",
   "url": "http://127.0.0.1:8790/mcp",
-  "headers": { "Authorization": "Bearer 你的token" },
-  "timeout": 15,
-  "tool_call_timeout_sec": 60
+  "headers": {
+    "Authorization": "Bearer <替换为 config.json 的 token 字段值>"
+  },
+  "timeout": 60
 }
 ```
 
-- `mode` 用 `http`（Streamable HTTP）。也可用 `remote` 让客户端自动探测，但会多一次协商。
-- **`Authorization` 的值必须带 `Bearer ` 前缀**，只填裸 token 会得到 401。
-- URL 建议写全 `/mcp`。只填域名也能用（根路径做了兜底），但写全更明确。
-- `timeout` 是连接与初始化超时；`tool_call_timeout_sec` 是单次工具调用超时，`git_history` 在大仓上可能偏慢，建议 ≥ 60。
-- 配置完成后在聊天里发 `!func`（或对应平台的工具列表命令）可确认工具已注册：检索 5 个，接入 issue 后另加 2（只读）或 4 个。
-- 最后把这个 MCP server 绑定到目标流水线，模型才会看到这些工具。
+| 字段 | 说明 |
+|---|---|
+| `name` | AstrBot 工具列表里显示的名称，英文唯一，建议 `repomcp` |
+| `transport` | **必须写 `streamable_http`**——repoMcp 是无状态 Streamable HTTP，没有 SSE/WebSocket 会话。写其它值会直接失败 |
+| `url` | repoMcp 服务的 `/mcp` 端点，端口与 config.json 的 `listen` 一致（默认 `:8790`）。反代场景填 `https://域名/mcp` |
+| `headers.Authorization` | `Bearer ` + config.json 的 `token` 字段裸串。**必须带 `Bearer ` 前缀**，只填裸 token 会得到 401 |
+| `timeout` | 单次工具调用超时（秒），建议 ≥ 60。大仓首次同步或 `git_history` 深查询可能接近 30–50 秒 |
 
-排障顺序：先 `curl <地址>/healthz` 看 `ready` 与每仓 `error`（此接口不需要鉴权），
-再用下面的探针验证 MCP 握手，最后才怀疑客户端配置。
+AstrBot 管理后台地址（6185 端口）**不是** MCP 通信地址——它只是你粘贴配置的 WebUI。repoMcp 必须在本地启动监听 `:8790`，AstrBot 才会通过 streamable_http 调用工具。
+
+### 其它 MCP 客户端
+
+通用客户端（如 Claude Desktop、OpenClaw、Trae 等）配置示例字段名可能不同，但三条必须满足：传输层为 streamable_http、URL 以 `/mcp` 结尾、带 Bearer Authorization 头。
+
+排障顺序：先 `curl http://127.0.0.1:8790/healthz` 看 `ready` 与每仓 `error`（此接口不需要鉴权），再用下面的探针验证 MCP 握手，最后才怀疑客户端配置。
 
 **安全**：源码侧完全只读——不执行仓库中的任何代码，也不接受任意路径读取（`read_file` 只能读已索引的受版本控制文件，并拒绝 `..` 与绝对路径）。唯一的写入面是 issue，且实现上只有「建 issue / 评论 / 改状态与标签」四种动作，没有任何删除端点，最坏后果是多一条可被人工撤销的 issue。但本服务会把私有仓源码送进 LLM——请确认所用模型的数据策略，并把服务绑定在内网或 `127.0.0.1`。
 
@@ -170,6 +179,71 @@ P0 级额外安全基线：
 | Panic 恢复 | `/mcp` 及其它端点 panic 被 recoverMiddleware 捕获，分别返回 `-32603 internal error`（JSON-RPC）或 `500 server error`，不会拖垮进程 |
 | 优雅关闭 | SIGINT/SIGTERM 触发后先 `http.Shutdown`（30s 宽限）再 `Store.Shutdown()`，等待同步循环干净退出后再终止 |
 | git 子进程防护 | 全局并发 git 子进程受 `gitSem`（2–6，等于 CPU 核数夹到范围）限制；单个子进程 stdout/stderr 各自最多 128 MiB，超过立刻报错或截断，防止 OOM |
+
+## GitHub Token 权限说明
+
+`config.json` 里的 `githubToken` 控制 issue 工具能否工作。GitHub 有两层权限模型，**必须同时满足两层才能写入**：
+
+| 层 | 判定主体 | 内容 |
+|---|---|---|
+| 账号层 | GitHub 账号本身 | 你对目标仓是 owner / collaborator / member，还是外部访客 |
+| Token 层 | PAT 的 scope（Classic）或 permissions（fine-grained） | token 被授予了哪些操作权限 |
+
+两层任何一层不满足，GitHub 都会返回 403，错误消息通常是 `Resource not accessible by personal access token`。
+
+### Classic vs fine-grained 选型
+
+| 维度 | Classic（`ghp_` 前缀） | fine-grained（`github_pat_` 前缀） |
+|---|---|---|
+| 粒度 | scope 粗——勾 `public_repo` 一选 = 所有公开仓完整读写 | 按仓 + 按功能（Issues: Read and write / Contents: Read-only） |
+| 他人公开仓写 issue | **可以**——`public_repo` scope 对所有公开仓自动授予 issue 读写，不需要 collaborator 身份 | **不行**——必须是目标仓 collaborator 才能写入，scope 勾全也没用 |
+| 撤销/变更 | 只能删除整个 token，无法局部减权 | 可以改 scope（勾多了能减），token 字符串不变 |
+| 本项目最小 scope | 写 issue：`public_repo`（仅需公开仓）或 `repo`（含私有仓）<br>只读 issue：不勾任何 scope（匿名读） | 写 issue：Issues Read and write + Contents Read-only（按仓逐个勾）<br>只读 issue：Issues Read-only（按仓或 All public） |
+| 适用场景 | 跨多个他人公开仓发 issue；scope 需求简单 | 只给自己拥有的仓；需要精确控制哪些仓、哪些操作 |
+| GitHub 推荐 | legacy，不推新 | 官方推荐 |
+
+### 场景 → Token 类型对照
+
+| 场景 | 推荐 token | scope | 备注 |
+|---|---|---|---|
+| 给自己拥有的仓代发 issue | fine-grained（推荐） | Issues Read and write + Contents Read-only（按仓） | 精确最小权限 |
+| 给多个他人公开仓代发 issue | **Classic `public_repo`** | `public_repo` | 实测可行（Classic 对公开仓 issue 写入不要求 collaborator）；fine-grained 在同样条件下会 403 |
+| 只读 issue（search_issues / read_issue） | 任意类型甚至不填 | fine-grained: Issues Read-only；Classic: 不勾 scope | 公开仓 issue 匿名可读；填 token 只是为了更高的 API 限流配额 |
+| 私有仓 | 必须 Classic `repo` 或 fine-grained 按仓勾 | Classic: `repo`；fine-grained: 对应仓 Issues Write + Contents Read-only | 私有仓必须有 token |
+
+### per-repo token 覆盖
+
+`config.json` 支持 `repos[].issues.token` 字段——可以给每个仓单独指定 PAT，覆盖全局 `githubToken`。当不同仓分属不同组织、需要不同账号的 token 时用这个。
+
+```json
+{
+  "githubToken": "全局 token（给大多数仓用）",
+  "repos": [
+    {
+      "name": "corp_repo",
+      "issues": { "write": true, "token": "该组织专用 PAT" }
+    }
+  ]
+}
+```
+
+### 快速验证 token 是否够
+
+配置好后用 curl 验证（替换 token 和仓名）：
+
+```bash
+# 读权限（任何 token 都能过）
+curl -s -H "Authorization: Bearer <token>" \
+  https://api.github.com/repos/<owner>/<repo>/issues
+
+# 写权限（会创建一条 issue，记得立即关闭）
+curl -s -X POST -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"[test] ignore","body":"will close"}' \
+  https://api.github.com/repos/<owner>/<repo>/issues
+```
+
+第二个请求返回 201 = token + 账号两层权限都够；返回 403 = 至少一层不足，看错误消息里是"Resource not accessible"（账号层）还是"Missing scope"（token 层）。
 
 ## issue 能力
 
@@ -226,7 +300,6 @@ REPOMCP_PROBE_URL=https://你的域名/mcp REPOMCP_PROBE_TOKEN=你的token \
 - 符号提取是**语言感知的正则启发式**，不是完整语法分析。选它是为了保住零依赖与 `CGO_ENABLED=0` 交叉编译；代价是复杂泛型签名、宏生成的定义可能漏抽。`search_code` 的全文检索不受此影响。
 - 索引常驻内存，随仓库规模线性增长。百万行级仓库请留意进程内存。
 - clone 使用 `--depth 1` 首次 + `--depth 50` 增量 fetch。`git_history` 默认展示最近 50 层，不够时可在工具里传 `limit` 拉大。
-- 当前 issue 代提交走 GitHub REST，需要目标仓 owner 或 collaborator 权限。对他人的公开仓发 issue：PAT fine-grained 要勾 `issues:write`，**且你必须是目标仓的 owner 或被加为 collaborator**，仅 PAT scope 完整没用。这是 GitHub 权限模型本身的限制，项目侧无法绕过。
 
 ---
 
