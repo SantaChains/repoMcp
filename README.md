@@ -1,6 +1,8 @@
-# repoMcp
+# repoMcp（SantaChains 改版）
 
 给 **IM 机器人 / MCP 客户端** 用的仓库源码检索 MCP 服务：让聊天机器人里的 LLM 能查你的源码、带着可核验的出处回答问题，并在调研清楚之后代用户提交与管理 issue。
+
+> 本项目基于 [zerx-lab/repoMcp](https://github.com/zerx-lab/repoMcp)（MIT 许可）改版。原始项目核心设计（本地 clone + 内存 BM25 索引 + Streamable HTTP MCP）全部保留；改版新增多仓并行同步、浅克隆、结构化日志与 trace-id、配置强校验与脱敏、敏感词过滤、HTTP 超时与优雅关闭、/sync 手动同步端点、双层速率限制等功能。详见底部「原始项目 vs 本改版」章节。
 
 - 传输：**无状态 Streamable HTTP**，单端点 `POST /mcp`，Bearer 鉴权。
 - 检索：本地 clone + 内存倒排索引（BM25）+ 正则符号表。**不需要 embedding、向量库或任何外部服务**。
@@ -223,4 +225,77 @@ REPOMCP_PROBE_URL=https://你的域名/mcp REPOMCP_PROBE_TOKEN=你的token \
 
 - 符号提取是**语言感知的正则启发式**，不是完整语法分析。选它是为了保住零依赖与 `CGO_ENABLED=0` 交叉编译；代价是复杂泛型签名、宏生成的定义可能漏抽。`search_code` 的全文检索不受此影响。
 - 索引常驻内存，随仓库规模线性增长。百万行级仓库请留意进程内存。
-- clone 使用 `--depth 200`，`git_history` 只能看到最近 200 次提交。
+- clone 使用 `--depth 1` 首次 + `--depth 50` 增量 fetch。`git_history` 默认展示最近 50 层，不够时可在工具里传 `limit` 拉大。
+- 当前 issue 代提交走 GitHub REST，需要目标仓 owner 或 collaborator 权限。对他人的公开仓发 issue：PAT fine-grained 要勾 `issues:write`，**且你必须是目标仓的 owner 或被加为 collaborator**，仅 PAT scope 完整没用。这是 GitHub 权限模型本身的限制，项目侧无法绕过。
+
+---
+
+## 原始项目 vs 本改版
+
+| 维度 | 原始 [zerx-lab/repoMcp](https://github.com/zerx-lab/repoMcp) | SantaChains 改版 |
+|---|---|---|
+| 基础架构 | Go 本地 clone + BM25 + Streamable HTTP | 相同，核心设计保留 |
+| 多仓同步 | 串行逐仓 Load | goroutine 并行，耗时 ≈ max(各仓) |
+| git clone | `--depth 200` | `--depth 1 --no-tags` 首次，`--depth 50` 增量 fetch |
+| 指令词缓存 | 每次 initialize 重新拼接 | 启动 + 每次同步后重建并缓存，initialize 零分配 |
+| 工具数量 | 5 检索 + 4 issue + PR（tools_pulls.go） | 5 检索 + 4 issue（PR 工具**暂未恢复**，见未来路线） |
+| 日志 | 标准 log 包 | 结构化 JSON + trace-id |
+| 配置校验 | 弱校验 | 11 项强校验 + -check-config / -print-config 预检查 |
+| 敏感词过滤 | 无 | SanitizeError 正则脱敏（7 类 GitHub PAT + 自定义 token） |
+| HTTP 防护 | 无显式超时/大小上限 | ReadHeaderTimeout/ReadTimeout/WriteTimeout/IdleTimeout + MaxHeaderBytes + 1 MB body 上限 |
+| 优雅关闭 | 无 | SIGINT/SIGTERM → http.Shutdown → Store.Shutdown |
+| /sync 端点 | 无 | POST /sync 手动触发，blocking 同步模式，singleflight 防重复 |
+| issue 限频 | 单仓每小时 | 单仓 + 全局 + reporter 哈希桶 **三层同时生效** |
+| LICENSE | 无 | MIT（原始作者 zerx-lab + 改版作者 SantaChains 双版权） |
+
+## 未来路线审计
+
+参考同类项目 [RepoMCP（Python 版，纯 GitHub API）](https://github.com/areeb1501/RepoMCP) 的能力清单，以下是基于本项目架构（本地 clone + git 子进程 + BM25 内存索引）的可借鉴功能筛选。**不适合借鉴的是纯 API 路线（如 Vercel 无状态部署、整个文件重写）——我们的本地索引架构质量更高，必须坚持。**
+
+### P1：容易实现，价值高（补回原始功能 + 轻量扩展）
+
+| 功能 | 来源 | 实现路径 | 价值 |
+|---|---|---|---|
+| 补回 `tools_pulls.go`（list/get/create PR） | 原始项目有、改版时丢失 | GitHub REST API，和现有 issue.go 同级，约 300 行 | PR 管理是原始项目已有能力，不应丢失 |
+| `get_diff`（两分支/两 commit 间 diff） | Python RepoMCP 有 | `git diff branch1..branch2 --stat` + 可选带行号片段 | 回答"这次改了什么"是高频提问，当前 git_history 不够 |
+| `get_commit`（单 commit 详情） | Python RepoMCP 有 | `git show --stat --format=fuller <sha>` | git_history 只能列，看不到单 commit 全貌 |
+| `list_branches`（分支列表） | Python RepoMCP 有 | `git branch -a` 本地已有，或 GitHub REST 远端 | 让模型知道有哪些分支可以对比 |
+| `search_file_contents`（正则模式搜索） | Python RepoMCP 有 | 对已索引文件用 Go `regexp` 做匹配，和 BM25 并行召回 | BM25 查"这个类有没有被谁实例化"很弱，正则补漏 |
+| `show_common_workflows`（MCP prompts 端点） | Python RepoMCP 有 | `prompts/list` 返回空 → 改为返回 3-5 个预定义模板（issue 调研流程、PR 检查清单、代码定位流程） | 小模型从 prompts 端点拉模板比自己组织更稳 |
+
+### P2：中等难度，需新增写能力
+
+| 功能 | 实现路径 | 风险 |
+|---|---|---|
+| `create_branch` / `delete_branch` | `git branch` 命令 + GitHub REST 远端同步 | 分支删除不可恢复，需服务端护栏（禁止删 main/master/production） |
+| `reset_branch_to_commit` | `git reset --hard <sha>` + push --force-with-lease | 写操作，必须走 feature branch 隔离 |
+| `revert_file_to_commit` | `git checkout <sha> -- <path>` | 单行操作，风险可控 |
+| `patch_file`（局部修改文件） | 接受 unified diff → `git apply patch` | 小模型生成合规 diff 有难度，需要护栏（最大 diff 行数、不允许跨文件） |
+| 标签白名单配置增强 | 当前已有，扩到 issue + PR 统一 | 低 |
+
+### P3：架构扩展（长周期）
+
+| 功能 | 说明 | 前提 |
+|---|---|---|
+| Docker 镜像 + systemd 服务文件 | 取代 Vercel 无状态部署（不适合数据目录场景） | 容器化需求明确 |
+| Prometheus 指标暴露 | /metrics 端点：同步耗时、工具调用计数、issue 创建率、索引大小 | 运维大盘接入 |
+| CJK 分词优化 | 当前 BM25 对中文分词差，可加 bigram 拆分替代单字 token | 中文检索成为主场景 |
+| 配置热加载 | SIGHUP 或 `POST /config/reload` 刷新 repos 数组、新增仓触发异步 clone | 运维频繁增删仓 |
+| 文件 CRUD + PR 全流程 | `create_or_update_file` / `delete_file` / `rename_or_move_file` → 创建 feature branch → commit → push → create_pull_request | 从"只读检索 + issue 代提"扩展到"代码编辑 + PR" |
+| 分支保护规则 | 配置里指定 protected branches（main/master/production），所有写操作自动走 feature branch → PR 流程 | 代码编辑能力落地后才有意义 |
+
+### 明确不做
+
+| 功能 | 原因 |
+|---|---|
+| GitHub Search API 替代本地索引 | BM25 质量远高于 GitHub Search（CJK 差、60 次/分钟限流、结果截断） |
+| Vercel / Serverless 部署 | 本地 clone + 数据目录是架构核心，无状态 Serverless 不适合 |
+| 向量检索 / embedding | 与 BM25 精确匹配相比复杂度换不来质量收益 |
+| 整个文件重写（create_or_update_file） | 走 patch_file 路线，局部编辑更安全、更省 token |
+| 任何删除端点（delete_branch / delete_file / delete_pr） | 原始项目设计就"契约刻意不含任何删除操作"，本改版保留此原则 |
+
+### 参考对比
+
+- **GitHub REST 路线 vs 本地 git 路线**：Python RepoMCP（纯 API）的优势是零依赖、无本地存储、可 Serverless 部署；劣势是搜索弱、限流紧、无法做符号抽取和 BM25。本项目坚持本地 git + BM25，因为消费方是 IM 小模型，检索质量比部署方便重要。
+- **Python RepoMCP 的 `patch_file`** 设计思路值得借鉴：让模型只生成目标片段的 unified diff，而不是整个文件重写。我们用本地 `git apply` 比它走 GitHub REST contents API 更高效。
+- **Python RepoMCP 的分支保护** 强制所有写操作走 feature branch + PR 流程。这个安全护栏思路优秀，等 P3 代码编辑能力落地后必须跟上。
