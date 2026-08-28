@@ -41,9 +41,22 @@ IM 机器人 / MCP 客户端的仓库源码检索与 issue 管理服务。让 LL
 
 initialize 握手时下发 instructions：可用仓库清单、各仓 issue 能力、工具选择规则，要求回答必须引用来源、检索无果不得编造。
 
+## 本地配置文件
+
+四个 JSON 文件分为两类。**实配文件已被 .gitignore 忽略，不要提交到任何 Git 平台。**
+
+| 文件 | 角色 | 是否入库 | 作用 |
+|---|---|---|---|
+| `config.example.json` | 服务端配置模板 | ✅ 入库 | 字段最全：含双仓示例、默认 exclude、labels 白名单。**最快上手：复制它改名 config.json → 改 token / githubToken → 启动** |
+| `config.json` | 服务端实配 | ❌ 被忽略 | 实际生效的配置。token、GitHub PAT、仓列表、issue 读写权限都在这 |
+| `astrbot_mcp.example.json` | AstrBot 侧配置模板 | ✅ 入库 | 单一样板：transport/url/headers/timeout，字段在文件「备注」里逐行解释 |
+| `astrbot_mcp.json` | AstrBot 侧实配 | ❌ 被忽略 | 填完复制后直接粘贴到 AstrBot WebUI → MCP → 新增服务器 的配置框 |
+
+最快上手：复制 `config.example.json` → 改名 `config.json` → 改 `token` 与 `githubToken` → 跑 `-check-config` 通过 → 启动。
+
 ## 配置
 
-复制 `config.example.json` 为 `config.json`：
+复制 `config.example.json` 为 `config.json`（或直接改 example 拷贝）。示例：
 
 ```json
 {
@@ -51,6 +64,7 @@ initialize 握手时下发 instructions：可用仓库清单、各仓 issue 能�
   "token": "MCP 共享长随机串",
   "dataDir": "./data",
   "syncInterval": "15m",
+  "gitTimeout": "3m",
   "maxResponseBytes": 12000,
   "githubToken": "GitHub PAT",
   "maxIssueCreatesPerHour": 5,
@@ -81,22 +95,69 @@ initialize 握手时下发 instructions：可用仓库清单、各仓 issue 能�
 | `maxIssueCreatesPerHour` | 单仓每小时创建上限，默认 5，`0` 不限 |
 | `repos[].name` | 仓短名，`^[a-z0-9][a-z0-9._-]{0,63}$` |
 | `repos[].desc` | 一句话说明，下发到 instructions |
+| `repos[].url` | **必填**。仓库 Git clone URL，`.git` 后缀可选 |
+| `repos[].ref` | 分支名，默认 `main`；公开仓常见 `master` 必须显式写 |
 | `repos[].webBase` | permalink 前缀；留空从 `url` 推导 |
 | `repos[].include` / `exclude` | 通配符过滤，`*` 不跨 `/`、`**` 跨 `/`、`?` 单字符 |
 | `repos[].dir` | 覆盖本地路径 |
-| `repos[].issues` | 省略 = 该仓无 issue 能力；`{}` = 只读；`{"write": true}` = 可创建与管理 |
+| `repos[].issues` | **三态决定工具挂载：** 省略键 = 仅 5 检索工具；`{}` 或 `{"write": false}` = 5 检索 + 2 issue 读 + 2 PR 读（共 9）；`{"write": true}` = 全部 13 工具（含 4 issue 写 + 2 PR 写） |
 | `repos[].issues.slug` | `owner/repo`，留空从 `webBase` / `url` 推导；推不出**启动失败** |
 | `repos[].issues.token` | 覆盖全局 `githubToken`（跨组织多 PAT） |
 | `repos[].issues.labels` | 允许模型使用的标签白名单；留空以仓现有标签为准 |
 
-环境变量覆盖：`REPOMCP_CONFIG` / `REPOMCP_LISTEN` / `REPOMCP_TOKEN` / `REPOMCP_DATA` / `REPOMCP_GITHUB_TOKEN`。
+**环境变量覆盖，优先级：环境变量 > config.json：**
+
+| 环境变量 | 覆盖字段 |
+|---|---|
+| `REPOMCP_CONFIG` | 命令行 `-config` 参数（配置文件路径本身） |
+| `REPOMCP_LISTEN` | `listen` |
+| `REPOMCP_TOKEN` | `token` |
+| `REPOMCP_DATA` | `dataDir` |
+| `REPOMCP_GITHUB_TOKEN` | `githubToken` |
 
 私有仓 clone：URL 内嵌 token（`https://x-access-token:<PAT>@github.com/owner/repo.git`）或宿主预配凭据助手。服务强制 `GIT_TERMINAL_PROMPT=0`，凭据缺失直接失败。
 
-## 运行
+## 构建
+
+零第三方 Go 包，`CGO_ENABLED=0` 单静态二进制，无运行时依赖（除系统 git）。
 
 ```bash
+# 当前平台（Windows 输出 repomcp.exe，Linux/macOS 输出 repomcp）
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.serverVersion=v0.1.0-SantaChains" -o repomcp .
+
+# Windows PowerShell（当前环境默认就是 CGO_ENABLED=0，可省略）
+go build -trimpath -ldflags="-s -w -X main.serverVersion=v0.1.0-SantaChains" -o repomcp.exe .
+
+# 交叉编译（示例：Linux amd64，在 Windows 本机上也能出 Linux 二进制）
+$env:CGO_ENABLED="0"; $env:GOOS="linux"; $env:GOARCH="amd64"
+go build -trimpath -ldflags="-s -w -X main.serverVersion=v0.1.0-SantaChains" -o repomcp-linux-amd64 .
+```
+
+构建产物约 7.4 MiB。`-trimpath` + `-ldflags="-s -w"` 去掉调试信息和编译路径，减小体积并避免泄漏本机目录。
+
+## 构建与运行
+
+**首次启动，推荐三步：**
+
+```bash
+# 1. 校验配置（11 项强校验 + 摘要，不启动）
+go run . -check-config
+
+# 2. 打印脱敏后的最终配置（token / PAT 只露首尾，确认覆盖优先级）
+go run . -print-config
+
+# 3. 正式启动
 go run . -config config.json
+```
+
+**用已构建的二进制运行（推荐生产使用）：**
+
+```bash
+# Windows
+repomcp.exe -config config.json
+
+# Linux / macOS
+./repomcp -config config.json
 ```
 
 启动参数：
@@ -122,7 +183,7 @@ go run . -config config.json
 
 ## 接入 AstrBot
 
-打开 AstrBot 管理后台 → 扩展 → MCP（`http://localhost:6185/#/extension/mcp`）→ 新增服务器：
+仓库已含 `astrbot_mcp.example.json`（单一样板，字段解释写在文件「备注」里）。直接复制该文件、替换 `Authorization` 后，粘贴到 AstrBot 管理后台 → 扩展 → MCP（`http://localhost:6185/#/extension/mcp`）→ 新增服务器的配置框即可。字段清单如下：
 
 ```json
 {
