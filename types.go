@@ -191,23 +191,23 @@ type IssueTracker interface {
 
 // Pull 是一条 Pull Request。Body 已把 CRLF 规整为 LF。
 type Pull struct {
-	Number      int
-	Title       string
-	State       string // open / closed / merged
-	Author      string
-	HeadRef     string // 源分支
-	BaseRef     string // 目标分支
-	HeadSHA     string
-	Additions   int
-	Deletions   int
-	Commits     int
-	Files       int
-	Labels      []string
-	Comments    int
-	CreatedAt   string
-	UpdatedAt   string
-	URL         string
-	Body        string
+	Number    int
+	Title     string
+	State     string // open / closed / merged
+	Author    string
+	HeadRef   string // 源分支
+	BaseRef   string // 目标分支
+	HeadSHA   string
+	Additions int
+	Deletions int
+	Commits   int
+	Files     int
+	Labels    []string
+	Comments  int
+	CreatedAt string
+	UpdatedAt string
+	URL       string
+	Body      string
 	// DiffSummary 是文件级差异摘要（path ±lines），仅 GetPull 时填充。
 	DiffSummary []PullFile
 }
@@ -223,7 +223,7 @@ type PullFile struct {
 
 // PullMergeResult 是合并结果。SHA 空时 GitHub 返回非 2xx，Merged=false。
 type PullMergeResult struct {
-	Merged bool
-	SHA    string // 合并生成的提交 sha（squash merge 时是 squash commit）
+	Merged  bool
+	SHA     string // 合并生成的提交 sha（squash merge 时是 squash commit）
 	Message string
 }

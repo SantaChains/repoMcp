@@ -561,21 +561,21 @@ func ghRankByText(items []Issue, text string, limit int) []Issue {
 // ── Pull Request ──────────────────────────────────────────────
 
 type ghPullJSON struct {
-	Number      int       `json:"number"`
-	Title       string    `json:"title"`
-	State       string    `json:"state"` // open / closed
-	Merged      bool      `json:"merged"`
-	Body        string    `json:"body"`
-	HTMLURL     string    `json:"html_url"`
-	Comments    int       `json:"comments"`
-	Additions   int       `json:"additions"`
-	Deletions   int       `json:"deletions"`
-	Commits     int       `json:"commits"`
-	ChangedFiles int      `json:"changed_files"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	MergeCommitSHA *string `json:"merge_commit_sha"`
-	User        struct {
+	Number         int       `json:"number"`
+	Title          string    `json:"title"`
+	State          string    `json:"state"` // open / closed
+	Merged         bool      `json:"merged"`
+	Body           string    `json:"body"`
+	HTMLURL        string    `json:"html_url"`
+	Comments       int       `json:"comments"`
+	Additions      int       `json:"additions"`
+	Deletions      int       `json:"deletions"`
+	Commits        int       `json:"commits"`
+	ChangedFiles   int       `json:"changed_files"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	MergeCommitSHA *string   `json:"merge_commit_sha"`
+	User           struct {
 		Login string `json:"login"`
 	} `json:"user"`
 	Head struct {
@@ -697,10 +697,10 @@ func (g *GitHub) GetPull(ctx context.Context, r *Repo, number int) (Pull, error)
 // CreatePull 新建 PR。PR 一旦不存在 head/base，GitHub 会返回 422，错误由 ghError 翻译。
 func (g *GitHub) CreatePull(ctx context.Context, r *Repo, head, base, title, body string) (Pull, error) {
 	payload := map[string]any{
-		"title": title,
-		"head":  head,
-		"base":  base,
-		"body":  body,
+		"title":                 title,
+		"head":                  head,
+		"base":                  base,
+		"body":                  body,
 		"maintainer_can_modify": true,
 	}
 	var j ghPullJSON

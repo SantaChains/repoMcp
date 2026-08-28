@@ -19,13 +19,13 @@ import (
 )
 
 const (
-	pullTitleMinRunes    = 10
-	pullTitleMaxRunes    = 300
-	pullBodyMinRunes     = 20
-	pullBodyMaxRunes     = 16000 // PR 正文允许更长（会附改动摘要+测试证据）
-	pullMsgMinRunes      = 10
-	pullMsgMaxRunes      = 4000
-	pullBranchMaxRunes   = 80
+	pullTitleMinRunes  = 10
+	pullTitleMaxRunes  = 300
+	pullBodyMinRunes   = 20
+	pullBodyMaxRunes   = 16000 // PR 正文允许更长（会附改动摘要+测试证据）
+	pullMsgMinRunes    = 10
+	pullMsgMaxRunes    = 4000
+	pullBranchMaxRunes = 80
 	// protectedBases 是不允许作为 PR 源分支（head）的分支名——防止模型不小心改了目标分支。
 	// 作为 PR 的目标分支（base）时仍然允许。
 )
@@ -499,4 +499,3 @@ func (s *Server) toolMergePull(ctx context.Context, args map[string]any) (string
 	time.Sleep(time.Second)
 	return sb.String(), nil
 }
-
